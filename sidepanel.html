@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>InboxFoundry</title>
+  <link rel="stylesheet" href="sidepanel.css">
+  <link rel="stylesheet" href="disclosure.css">
+</head>
+<body>
+  <section id="onboarding" class="onboarding" hidden aria-labelledby="onboardingTitle">
+    <div class="onboarding-card">
+      <span id="onboardingProgress" class="pill">1 of 3</span>
+      <div class="onboarding-slide" data-onboarding-step="1">
+        <h2 id="onboardingTitle">Find exactly what you need</h2>
+        <p>Collect specific Gmail emails and attachments using sender, date, keyword, filename, and file-type filters.</p>
+      </div>
+      <div class="onboarding-slide" data-onboarding-step="2" hidden>
+        <h2>Review before exporting</h2>
+        <p>See matching emails and files, understand exclusions, and choose what should be included.</p>
+      </div>
+      <div class="onboarding-slide" data-onboarding-step="3" hidden>
+        <h2>Your emails stay on your computer</h2>
+        <p>InboxFoundry has no mailbox server, analytics, ads, or remote processing. Requested exports are saved locally.</p>
+      </div>
+      <div class="onboarding-actions"><button id="onboardingBack" class="quiet" hidden>Back</button><button id="onboardingNext">Next</button><button id="onboardingStart" hidden>Start</button></div>
+    </div>
+  </section>
+  <header class="topbar">
+    <div><h1>InboxFoundry</h1><p>Find, review and export exactly the Gmail emails and attachments you need.</p></div>
+    <span id="version" class="pill"></span>
+  </header>
+
+  <main>
+    <section class="status-card" aria-live="polite">
+      <div class="status-line"><strong id="status">Connecting to Gmail…</strong><span id="jobState" class="pill">Idle</span></div>
+      <div class="progress"><i id="progressBar"></i></div>
+      <div class="metrics">
+        <span><b id="inspected">0</b> inspected</span><span><b id="matched">0</b> matched</span>
+        <span><b id="rejected">0</b> rejected</span><span><b id="messages">0</b> messages</span>
+        <span><b id="downloads">0</b> files started</span><span><b id="downloadsComplete">0</b> files complete</span>
+      </div>
+      <p id="rate" class="micro"></p>
+      <p id="notice" class="notice" hidden></p>
+    </section>
+
+    <section id="disclosure" class="disclosure advanced-section">
+      <strong>Before your first export</strong>
+      <p>InboxFoundry reads conversations shown in this Gmail tab, stores completed job records in this browser, and writes only the exports and attachments you request to Downloads. It has no server, analytics, ads, or remote processing.</p>
+      <button id="acknowledge">I understand — enable exports</button>
+    </section>
+
+    <section id="simpleHome" class="simple-home">
+      <div class="section-heading"><div><span class="eyebrow">Step 1 · Find</span><h2>What do you want to do?</h2></div><span class="local-badge">Local only</span></div>
+      <div id="intentChoices" class="intent-grid" role="radiogroup" aria-label="Export goal">
+        <button type="button" class="intent-card selected" data-intent="attachments" role="radio" aria-checked="true"><strong>Download Attachments</strong><span>Find and download Gmail files.</span></button>
+        <button type="button" class="intent-card" data-intent="emails" role="radio" aria-checked="false"><strong>Export Emails</strong><span>Save matching conversations locally.</span></button>
+        <button type="button" class="intent-card" data-intent="custom" role="radio" aria-checked="false"><strong>Custom Search</strong><span>Combine email and file filters.</span></button>
+      </div>
+      <div class="simple-form">
+        <label>Sender or email address<input id="simpleSender" placeholder="vendor@example.com"></label>
+        <label>Gmail keywords<input id="simpleKeyword" placeholder="invoice OR receipt"></label>
+        <div class="two"><label>From date<input id="simpleDateFrom" type="date"></label><label>To date<input id="simpleDateTo" type="date"></label></div>
+        <label>Filename contains<input id="simpleFilename" placeholder="invoice, signed, final"></label>
+        <div class="two"><label>Attachment type<select id="simpleFileType"><option value="all">All attachments</option><option value="pdf">PDF</option><option value="image">Images</option><option value="spreadsheet">Spreadsheets</option><option value="document">Documents</option><option value="archive">ZIP / archive</option></select></label><label>Attachments<select id="simpleHasAttachment"><option value="has">Must have an attachment</option><option value="any">May have attachments</option><option value="none">No attachments</option></select></label></div>
+      </div>
+      <p class="limit-note">Free Mode: up to 50 emails, 100 attachments, and approximately 250 MB per export. Limits are shown before export.</p>
+      <button id="advancedToggle" type="button" class="quiet full-width" aria-expanded="false">Advanced Filters</button>
+    </section>
+
+    <details class="advanced-section">
+      <summary>0. Gmail scope <span>Current view or search</span></summary>
+      <div class="panel">
+        <label>Scan scope<select id="scopeMode"><option value="current-view">All pages in current view</option><option value="current-page">Current result page only</option><option value="selected">Currently selected rows</option><option value="current-thread">Currently open thread</option></select></label>
+        <label class="checkline"><input id="incremental" type="checkbox">Skip threads completed by the latest successful batch in this exact Gmail scope</label>
+        <label>Gmail pacing<select id="pacingMs"><option value="100">Fast</option><option value="300" selected>Normal</option><option value="1000">Gentle</option><option value="2000">Very gentle</option></select></label>
+        <label>Custom Gmail query<input id="gmailQuery" placeholder="label:finance newer_than:1y"></label>
+        <div class="two"><label>From<input id="queryFrom" placeholder="vendor@example.com"></label><label>To<input id="queryTo" placeholder="me"></label></div>
+        <div class="two"><label>Subject phrase<input id="querySubject" placeholder="quarterly statement"></label><label>Attachment filename<input id="queryFilename" placeholder="invoice.pdf or pdf"></label></div>
+        <div class="two"><label>After<input id="queryAfter" type="date"></label><label>Before<input id="queryBefore" type="date"></label></div>
+        <div class="two"><label>Label<input id="queryLabel" placeholder="receipts"></label><label>Category<select id="queryCategory"><option value="">Any category</option><option value="primary">Primary</option><option value="social">Social</option><option value="promotions">Promotions</option><option value="updates">Updates</option><option value="forums">Forums</option><option value="reservations">Reservations</option><option value="purchases">Purchases</option></select></label></div>
+        <div class="two"><label>Larger than (MB)<input id="queryLarger" type="number" min="0" step="1"></label><label>Smaller than (MB)<input id="querySmaller" type="number" min="0" step="1"></label></div>
+        <label>Status<select id="queryStatus"><option value="">Any status</option><option value="unread">Unread</option><option value="read">Read</option><option value="starred">Starred</option><option value="important">Important</option><option value="muted">Muted</option></select></label>
+        <div class="checks vertical"><label><input id="queryAttachment" type="checkbox">Has attachment</label><label><input id="queryAnywhere" type="checkbox">Include Spam and Trash</label></div>
+        <button id="openSearch" class="quiet">Open this search in Gmail</button>
+        <p class="micro">InboxFoundry scans the Gmail list currently visible when a job starts.</p>
+      </div>
+    </details>
+
+    <details class="advanced-section">
+      <summary>1. Email rules <span id="emailSummary">All emails</span></summary>
+      <div class="panel">
+        <label>Include keywords or phrases<textarea id="includeTerms" rows="3" placeholder="invoice&#10;quarterly report"></textarea></label>
+        <div class="two">
+          <label>Terms must match<select id="includeMode"><option value="any">ANY term</option><option value="all">ALL terms</option></select></label>
+          <label>Match style<select id="matchType"><option value="contains">Contains</option><option value="exact">Exact field</option><option value="startsWith">Starts with</option><option value="endsWith">Ends with</option><option value="wildcard">Wildcard</option><option value="regex">Regular expression</option></select></label>
+        </div>
+        <label>Exclude keywords<textarea id="excludeTerms" rows="2" placeholder="newsletter, unsubscribe"></textarea></label>
+        <fieldset><legend>Search in</legend><div id="fields" class="checks">
+          <label><input type="checkbox" value="subject" checked>Subject</label><label><input type="checkbox" value="body" checked>Body</label>
+          <label><input type="checkbox" value="sender" checked>Sender</label><label><input type="checkbox" value="recipients" checked>Recipients</label>
+          <label><input type="checkbox" value="headers" checked>Headers</label><label><input type="checkbox" value="attachmentNames" checked>File names</label>
+          <label><input type="checkbox" value="thread">Combined thread</label><label><input type="checkbox" value="html">Raw HTML</label>
+        </div></fieldset>
+        <div class="two"><label>Sender contains<input id="senderInclude" placeholder="billing@example.com"></label><label>Exclude sender<input id="senderExclude" placeholder="no-reply"></label></div>
+        <div class="two"><label>Recipient contains<input id="recipientInclude" placeholder="me@example.com"></label><label>Exclude recipient<input id="recipientExclude" placeholder="archive@example.com"></label></div>
+        <div class="two"><label>Domain contains<input id="domainInclude" placeholder="example.com"></label><label>Exclude domain<input id="domainExclude" placeholder="marketing.example"></label></div>
+        <div class="two"><label>Subject contains<input id="subjectInclude" placeholder="statement"></label><label>Exclude subject<input id="subjectExclude" placeholder="promotion"></label></div>
+        <div class="two"><label>From date<input id="dateFrom" type="date"></label><label>To date<input id="dateTo" type="date"></label></div>
+        <div class="two"><label>Minimum messages<input id="minMessages" type="number" min="1"></label><label>Maximum messages<input id="maxMessages" type="number" min="1"></label></div>
+        <label>Attachment presence<select id="attachmentPresence"><option value="any">With or without attachments</option><option value="has">Must have an attachment</option><option value="none">Must have no attachments</option></select></label>
+        <label>Export content<select id="threadMode"><option value="whole-thread">Whole matching thread</option><option value="matching-messages">Only matching messages</option></select></label>
+        <label>ALL rules may match<select id="ruleScope"><option value="single-message">Within one message</option><option value="thread">Across different messages</option></select></label>
+        <div class="checks vertical"><label><input id="wholeWord" type="checkbox">Match whole words</label><label><input id="caseSensitive" type="checkbox">Case-sensitive</label><label><input id="requireMatchingAttachment" type="checkbox">Require an attachment matching file rules</label></div>
+      </div>
+    </details>
+
+    <details class="advanced-section">
+      <summary>2. Attachments <span id="attachmentSummary">Download all</span></summary>
+      <div class="panel">
+        <label>Attachment action<select id="attachmentAction"><option value="all">Download all detected files</option><option value="matching">Download only matching files</option><option value="metadata">List file metadata only</option><option value="none">Ignore files</option></select></label>
+        <fieldset><legend>File types</legend><div id="fileTypes" class="checks types">
+          <label><input type="checkbox" value="all" checked>All</label><label><input type="checkbox" value="pdf">PDF</label><label><input type="checkbox" value="spreadsheet">Spreadsheets</label><label><input type="checkbox" value="document">Documents</label><label><input type="checkbox" value="presentation">Presentations</label><label><input type="checkbox" value="image">Images</label><label><input type="checkbox" value="archive">Archives</label><label><input type="checkbox" value="data">Data</label><label><input type="checkbox" value="emailCalendarContact">Email/calendar</label><label><input type="checkbox" value="audio">Audio</label><label><input type="checkbox" value="video">Video</label><label><input type="checkbox" value="other">Other</label>
+        </div></fieldset>
+        <label>Custom extensions<input id="customExtensions" placeholder="dwg, psd, log"></label>
+        <div class="two"><label>Filename terms must match<select id="attachmentIncludeMode"><option value="any">ANY term</option><option value="all">ALL terms</option></select></label><label>Filename match style<select id="attachmentMatchType"><option value="contains">Contains</option><option value="exact">Exact</option><option value="startsWith">Starts with</option><option value="endsWith">Ends with</option><option value="wildcard">Wildcard</option><option value="regex">Regular expression</option></select></label></div>
+        <div class="two"><label>Filename includes<input id="filenameInclude" placeholder="signed, final"></label><label>Filename excludes<input id="filenameExclude" placeholder="thumbnail, logo"></label></div>
+        <div class="two"><label>Minimum size (MB)<input id="minMb" type="number" min="0" step="0.1"></label><label>Maximum size (MB)<input id="maxMb" type="number" min="0" step="0.1"></label></div>
+        <label class="checkline"><input id="includeInline" type="checkbox">Include inline images and signature assets</label>
+        <label class="checkline"><input id="excludeClutter" type="checkbox" checked>Exclude common logos, social icons, tracking pixels, and tiny images</label>
+        <label class="checkline"><input id="attachmentCaseSensitive" type="checkbox">Case-sensitive filenames</label>
+      </div>
+    </details>
+
+    <details class="advanced-section">
+      <summary>3. Output & safety <span>Local files</span></summary>
+      <div class="panel">
+        <fieldset><legend>Formats</legend><div id="formats" class="checks"><label><input type="checkbox" value="json" checked>JSON</label><label><input type="checkbox" value="ndjson">NDJSON</label><label><input type="checkbox" value="csv">CSV</label><label><input type="checkbox" value="text">Plain text</label><label><input type="checkbox" value="markdown">Markdown</label><label><input type="checkbox" value="html">Printable HTML</label><label><input type="checkbox" value="pdf">Merged basic PDF</label><label><input type="checkbox" value="pdfzip">Individual PDFs ZIP</label><label><input type="checkbox" value="emlzip">Reconstructed EML ZIP</label><label><input type="checkbox" value="mbox">Reconstructed MBOX</label><label><input type="checkbox" value="manifest">Attachment manifest</label><label><input type="checkbox" value="zip">Evidence ZIP</label></div><p class="micro">EML/MBOX are portable reconstructions from captured Gmail fields, not Google's original raw message source. Separately downloaded attachment binaries are not embedded.</p></fieldset>
+        <label>Record content<select id="contentMode"><option value="full">Full captured messages</option><option value="metadata">Metadata and match evidence only</option></select></label>
+        <div class="two"><label>Maximum matched threads<input id="maxThreads" type="number" min="1" max="250" value="250"></label><label>Maximum downloads<input id="maxDownloads" type="number" min="0" max="500" value="500"></label></div>
+        <label>Folder template<input id="folderTemplate" value="{batch}/{index} - {subject}"><span class="micro">Tokens: {batch}, {index}, {subject}, {senderDomain}, {date}</span></label>
+        <label>Split JSON every N threads (optional)<input id="splitRecords" type="number" min="1" max="250" placeholder="No splitting"></label>
+        <div class="checks vertical"><label><input id="includeRawHtml" type="checkbox" checked>Include raw message HTML</label><label><input id="includeGmailUrls" type="checkbox" checked>Include Gmail source URLs</label><label><input id="includeInternalIds" type="checkbox" checked>Include Gmail thread/message IDs</label><label><input id="redactAddresses" type="checkbox">Redact addresses in exported metadata</label><label><input id="autoComplete" type="checkbox" checked>Export automatically when complete</label><label><input id="autoStop" type="checkbox">Export partial results after Stop</label></div>
+        <label>Encryption passphrase<input id="encryptionPassphrase" type="password" autocomplete="new-password" placeholder="At least 10 characters"></label>
+        <button id="encryptedExport" class="quiet">Download encrypted JSON</button>
+        <label>Decrypt an InboxFoundry archive<input id="decryptArchive" type="file" accept=".ifenc,application/vnd.inboxfoundry.encrypted+json"></label>
+      </div>
+    </details>
+
+    <details class="advanced-section">
+      <summary>4. Destination <span>Local Downloads</span></summary>
+      <div class="panel">
+        <label>Destination<select id="destinationType"><option value="downloads">Chrome Downloads (local)</option></select></label>
+        <label>Root folder<input id="rootFolder" value="InboxFoundry" maxlength="80"></label>
+        <p class="micro">No file or mailbox data leaves this device. Cloud connectors are not enabled in this open-source build.</p>
+      </div>
+    </details>
+
+    <details class="advanced-section">
+      <summary>5. Attachment review <span id="attachmentWorkspaceSummary">No saved batch</span></summary>
+      <div class="panel">
+        <p class="micro">Review discovered file decisions and durable Chrome download states. Selecting file names can quickly build include or exclude rules for your next batch.</p>
+        <div class="two"><button id="refreshAttachmentWorkspace" class="quiet">Refresh review</button><button id="selectInterruptedDownloads" class="quiet">Select interrupted</button></div>
+        <div id="attachmentWorkspace" class="file-list" aria-label="Discovered attachments"></div>
+        <div id="attachmentGroups" class="micro"></div>
+        <div class="two"><button id="useSelectedIncludes" class="quiet">Add names to include rules</button><button id="useSelectedExcludes" class="quiet">Add names to exclude rules</button></div>
+        <h3>Download tasks</h3>
+        <div id="downloadWorkspace" class="file-list" aria-label="Download tasks"></div>
+        <button id="retrySelectedDownloads" class="quiet">Retry selected resumable files</button>
+      </div>
+    </details>
+
+    <details class="advanced-section advanced-tools-section">
+      <summary>6. Local file inspector <span id="localFileSummary">Opt-in · local only</span></summary>
+      <div class="panel">
+        <p class="micro">Select downloaded files to calculate real SHA-256 hashes, prove identical content, and search supported PDF, DOCX, XLSX, PPTX, image, and text-like files. PDF extraction supports bounded common stream encodings and embedded ToUnicode font maps. Optional English OCR runs locally from bundled Tesseract.js and PDF.js assets; no image, PDF, or recognized text is uploaded.</p>
+        <label>Files to inspect<input id="localFiles" type="file" multiple></label>
+        <label class="checkline"><input id="runOcr" type="checkbox">Run local English OCR on supported images and PDFs without searchable text</label>
+        <label>Maximum pages per scanned PDF<input id="ocrPages" type="number" min="1" max="20" value="10"></label>
+        <p class="micro">OCR is opt-in and slower. One session processes files sequentially: at most 20 selected images/PDF pages total, 20 MB per image, 50 MB per PDF, 16 megapixels per render, and 2 million recognized characters. Encrypted PDFs and SVG are not OCRed. Cancel terminates the OCR worker.</p>
+        <div class="two"><button id="analyzeLocalFiles" class="quiet">Analyze selected files locally</button><button id="cancelLocalAnalysis" class="danger" disabled>Cancel analysis</button></div>
+        <label>Search extracted text<input id="localFileSearch" type="search" placeholder="invoice number or phrase"></label>
+        <div id="localFileResults" class="file-list" aria-live="polite"></div>
+        <label class="checkline"><input id="includeLocalInsights" type="checkbox">Include reviewed classification, PII findings, and structured field suggestions in the exported report</label>
+        <fieldset><legend>Redact detected patterns from optional text copies</legend><div id="redactionTypes" class="checks"><label><input type="checkbox" value="email" checked>Email</label><label><input type="checkbox" value="phone" checked>Phone</label><label><input type="checkbox" value="payment-card" checked>Payment card</label><label><input type="checkbox" value="iban" checked>IBAN</label><label><input type="checkbox" value="government-id" checked>US SSN pattern</label></div></fieldset>
+        <p class="micro">Detection and redaction are best-effort suggestions. Review every copy before sharing; InboxFoundry can miss sensitive material or flag ordinary numbers.</p>
+        <button id="exportRedactedFiles" class="quiet" disabled>Download redacted text copies</button>
+        <div class="two"><button id="exportLocalAnalysis" class="quiet" disabled>Export hash report</button><button id="clearLocalAnalysis" class="danger" disabled>Clear inspector</button></div>
+      </div>
+    </details>
+
+    <section class="actions lean-actions">
+      <span class="eyebrow">Step 2 · Review</span>
+      <button id="start">Find matching emails and files</button>
+      <button id="resume" class="quiet" disabled>Resume saved job</button>
+      <button id="stop" class="warn" disabled>Stop safely</button>
+      <span class="eyebrow">Step 3 · Export</span>
+      <button id="export" class="quiet">Export reviewed results</button>
+      <details class="advanced-section action-utilities"><summary>Preview and recovery utilities</summary><div class="panel">
+        <button id="preview" class="quiet">Preview open thread</button>
+        <label>Dry-run threads (1–10)<input id="sampleLimit" type="number" min="1" max="10" value="3"></label>
+        <button id="dryRun" class="quiet">Test current-list sample</button>
+        <button id="estimate" class="quiet">Estimate saved output</button>
+        <button id="retryDownloads" class="quiet">Retry resumable files</button>
+      </div></details>
+    </section>
+
+    <details class="advanced-section advanced-tools-section">
+      <summary>Presets & data</summary>
+      <div class="panel">
+        <label>Starter workflow<select id="starterPreset"><option value="">Choose a workflow…</option><option value="invoices">Accounting · invoices & receipts</option><option value="contracts">Legal · contracts & signed documents</option><option value="realestate">Real estate · transaction documents</option><option value="resumes">HR/recruiting · résumés & applications</option><option value="travel">Travel · itineraries, rates & vouchers</option><option value="insurance">Insurance · claim documents</option><option value="procurement">Procurement · quotations & purchase orders</option><option value="projects">Projects · approvals & deliverables</option><option value="education">Education · account offboarding</option><option value="research">Research papers</option><option value="spreadsheets">All spreadsheet attachments</option></select></label>
+        <button id="loadStarter" class="quiet">Use starter workflow</button>
+        <label>Recent batches<select id="jobs"><option value="">Choose a retained batch…</option></select></label>
+        <button id="loadJob" class="quiet">Open selected batch</button>
+        <div class="preset-row"><input id="presetName" placeholder="Preset name"><button id="savePreset" class="quiet">Save</button></div>
+        <label>Saved presets<select id="presets"><option value="">Choose a preset…</option></select></label>
+        <div class="two"><button id="loadPreset" class="quiet">Load preset</button><button id="deletePreset" class="danger">Delete preset</button></div>
+        <div class="two"><button id="renamePreset" class="quiet">Rename selected</button><button id="duplicatePreset" class="quiet">Duplicate selected</button></div>
+        <button id="exportPresets" class="quiet">Export presets</button>
+        <label>Import presets<input id="importPresets" type="file" accept="application/json,.json"></label>
+        <button id="diagnostics" class="quiet">Download sanitized diagnostics</button>
+        <button id="reset" class="danger">Delete current job data</button>
+        <p id="storageUsage" class="micro">Calculating local storage…</p>
+        <div class="two"><button id="clearJobs" class="danger">Delete all jobs</button><button id="clearPresets" class="danger">Delete all presets</button></div>
+      </div>
+    </details>
+
+    <section id="previewResult" class="preview" hidden></section>
+    <footer>Email contents stay in your browser and downloaded files. InboxFoundry does not send mailbox data to an external server.</footer>
+  </main>
+  <script src="lib/product-schema.js"></script>
+  <script src="lib/gmail-query.js"></script>
+  <script src="lib/filter-engine.js"></script>
+  <script src="lib/attachment-analysis.js"></script>
+  <script src="lib/text-intelligence.js"></script>
+  <script src="lib/sha256.js"></script>
+  <script src="lib/pdf-parser.js"></script>
+  <script src="lib/office-parser.js"></script>
+  <script src="lib/ocr-engine.js"></script>
+  <script src="lib/local-file-analysis.js"></script>
+  <script src="lib/export-engine.js"></script>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

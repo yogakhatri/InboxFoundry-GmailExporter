@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose a focused privacy-preserving improvement
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes: { label: User problem, description: Describe the workflow problem without mailbox data. }
+    validations: { required: true }
+  - type: textarea
+    id: outcome
+    attributes: { label: Desired outcome }
+    validations: { required: true }
+  - type: textarea
+    id: privacy
+    attributes: { label: Privacy, permissions, and compatibility impact }
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Area
+      options: [Scope and filters, Attachments, Export formats, Reliability, Presets and workflows, Destination or API, Documentation]
+    validations: { required: true }

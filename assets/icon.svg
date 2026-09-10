@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="InboxFoundry logo">
+  <rect width="128" height="128" rx="26" fill="#123e2b"/>
+  <path d="M27 35h74l-9 34H75c-2 7-6 11-11 11s-9-4-11-11H36L27 35Z" fill="none" stroke="#f5f7f4" stroke-width="9" stroke-linejoin="round"/>
+  <path d="M32 69v21c0 5 4 9 9 9h46c5 0 9-4 9-9V69" fill="none" stroke="#f5f7f4" stroke-width="9" stroke-linecap="round"/>
+  <path d="m82 22 3 9 9 3-9 3-3 9-3-9-9-3 9-3 3-9Z" fill="#f0b84b"/>
+</svg>

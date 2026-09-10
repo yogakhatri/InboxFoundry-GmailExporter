@@ -1,0 +1,39 @@
+name: Bug report
+description: Report a reproducible InboxFoundry defect using synthetic data
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Never attach real email, exports, addresses, Gmail URLs, IDs, tokens, or filenames. Use synthetic data."
+  - type: input
+    id: version
+    attributes: { label: InboxFoundry version }
+    validations: { required: true }
+  - type: input
+    id: chrome
+    attributes: { label: Chrome version and operating system }
+    validations: { required: true }
+  - type: input
+    id: gmail
+    attributes: { label: Gmail language and scope mode }
+    validations: { required: true }
+  - type: textarea
+    id: reproduce
+    attributes: { label: Synthetic reproduction steps }
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes: { label: Expected behavior }
+    validations: { required: true }
+  - type: textarea
+    id: actual
+    attributes: { label: Actual behavior and sanitized error }
+    validations: { required: true }
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed all real mailbox content and identifiers.
+          required: true
