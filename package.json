@@ -1,17 +1,21 @@
 {
   "name": "inboxfoundry",
-  "version": "4.5.0",
+  "version": "0.1.0",
   "private": true,
-  "description": "Privacy-first Gmail filtering and export workspace.",
+  "description": "Find exactly the Gmail conversations and attachments you need and save them locally.",
+  "repository": "github:yogakhatri/InboxFoundry-GmailExporter",
+  "license": "MIT",
+  "engines": { "node": ">=20.11" },
   "scripts": {
-    "check:js": "node --check background.js && node --check content.js && node --check popup.js && node --check sidepanel.js && node --check lib/product-schema.js && node --check lib/gmail-query.js && node --check lib/job-machine.js && node --check lib/path-safety.js && node --check lib/gmail-adapter.js && node --check lib/filter-engine.js && node --check lib/attachment-analysis.js && node --check lib/text-intelligence.js && node --check lib/sha256.js && node --check lib/pdf-parser.js && node --check lib/office-parser.js && node --check lib/ocr-engine.js && node --check lib/local-file-analysis.js && node --check lib/export-engine.js && node --check lib/download-policy.js && node --check lib/job-store.js && node --check scripts/package.mjs && node --check scripts/validate.mjs && node --check scripts/browser-smoke.mjs",
+    "lint": "eslint .",
     "test:unit": "node --test tests/*.test.cjs",
     "validate": "node scripts/validate.mjs",
-    "test": "npm run check:js && npm run test:unit && npm run validate",
-    "test:browser": "node scripts/browser-smoke.mjs",
-    "test:release": "npm test && npm run test:browser",
+    "test": "npm run test:unit && npm run validate",
+    "test:e2e": "node tests/e2e/run.mjs",
+    "test:all": "npm test && npm run test:e2e",
     "package": "npm test && node scripts/package.mjs"
   },
-  "license": "MIT",
-  "engines": { "node": ">=20" }
+  "devDependencies": {
+    "eslint": "^9.0.0"
+  }
 }

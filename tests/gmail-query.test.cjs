@@ -2,11 +2,20 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const query = require('../lib/gmail-query.js');
 
-test('builds a reproducible Gmail query from friendly criteria', () => {
-  assert.equal(query.build({ from:'billing@example.com', subject:'quarterly statement', after:'2026-01-01', before:'2026-02-01', label:'finance', filename:'pdf', largerMb:2, hasAttachment:true, status:'unread', inAnywhere:true }),
-    'from:billing@example.com subject:"quarterly statement" filename:pdf after:2026/01/01 before:2026/02/01 label:finance larger:2M has:attachment is:unread in:anywhere');
+test('builds Gmail searches from the form', () => {
+  assert.equal(query.build({ from: 'a@b.c', subject: 'two words', hasAttachment: true }), 'from:a@b.c subject:"two words" has:attachment');
+  assert.equal(query.build({ raw: 'label:x', keywords: 'invoice OR receipt' }), 'label:x invoice OR receipt');
+  assert.equal(query.build({ largerMb: '5', smallerMb: '0', inAnywhere: true }), 'larger:5M in:anywhere');
+  assert.equal(query.build({}), '');
 });
 
-test('preserves an expert raw query and escapes quoted values', () => {
-  assert.equal(query.build({ raw:'newer_than:1y -category:promotions', subject:'say "hello"' }), 'newer_than:1y -category:promotions subject:"say \\"hello\\""');
+test('the To date includes that whole day', () => {
+  assert.equal(query.build({ after: '2026-01-01', before: '2026-01-31' }), 'after:2026/01/01 before:2026/02/01');
+  assert.equal(query.nextDay('2026-12-31'), '2027/01/01');
+  assert.equal(query.nextDay('2028-02-28'), '2028/02/29');
+});
+
+test('quotes cannot break out of an operator', () => {
+  assert.equal(query.quoted('a "b" c'), '"a  b  c"');
+  assert.equal(query.quoted('  '), '');
 });

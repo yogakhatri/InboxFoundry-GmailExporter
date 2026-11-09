@@ -1,986 +1,848 @@
+// Injected into the Gmail tab only when the side panel needs it. Drives Gmail's page to scan
+// conversations and to start attachment downloads. Exports are built in the side panel instead.
 (() => {
-  if (window.__gmailThreadExporterLoaded) return;
-  window.__gmailThreadExporterLoaded = true;
+  if (window.__inboxFoundry?.isAlive?.()) return;
+  const isAlive = () => !!globalThis.chrome?.runtime?.id;
+  window.__inboxFoundry = { isAlive };
 
-  const STORE_KEY = 'gmailThreadExporterStateV1';
-  const LEGACY_STORE_KEY = 'tqoGmailRawScraperV23';
-  const ACTIVE_JOB_KEY = 'inboxFoundryActiveJobId';
-  const DOWNLOAD_ROOT = 'InboxFoundry';
-  const schema = globalThis.InboxFoundry.schema;
-  const jobMachine = globalThis.InboxFoundry.jobMachine;
-  const pathSafety = globalThis.InboxFoundry.pathSafety;
-  const gmailAdapterModule = globalThis.InboxFoundry.gmailAdapter;
-  const filterEngine = globalThis.InboxFoundry.filterEngine;
-  const attachmentAnalysis = globalThis.InboxFoundry.attachmentAnalysis;
-  const exportEngine = globalThis.InboxFoundry.exportEngine;
+  const { schema, jobMachine, pathSafety, gmailAdapter, gmailDate, filterEngine } = globalThis.InboxFoundry;
+  const CONSENT_KEY = 'inboxFoundryPrivacyAcknowledgedV1';
+  const BATCH_COUNTER_KEY = 'inboxFoundryNextBatchNumber';
+  const LEASE_MS = 180000;
+  const MAX_THREAD_ATTEMPTS = 3;
+  const MAX_CONSECUTIVE_FAILURES = 5;
+  const MAX_UNREAD_SWEEPS = 25;
+  const MAX_CONCURRENT_DOWNLOADS = 3;
+  const DOWNLOAD_STALL_MS = 15 * 60 * 1000;
+  const EMAIL_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+
   const state = {
     running: false,
     stopRequested: false,
-    status: 'Idle',
-    scanned: 0,
-    matched: 0,
-    skipped: 0,
-    messages: 0,
-    attachments: 0,
-    attachmentFailures: 0,
+    stage: 'Idle',
     job: null,
-    config: schema.normalizeConfig(),
-    lastStoppedAt: null,
-    tabId: null,
-    exported: [],
-    scannedThreadKeys: new Set(),
-    options: {
-      downloadAttachments: true,
-      includeAllThreadMessages: true,
-      keywords: []
-    }
+    config: null,
+    done: new Set(),
+    attempts: new Map(),
+    ledger: new Map(),
+    seq: 0,
+    attachmentSeq: 0,
+    page: 1,
+    tabId: null
   };
 
-  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-  const rawText = (el) => (el?.innerText || el?.textContent || '').trim();
-  const normalize = (s = '') => String(s).replace(/\s+/g, ' ').trim();
-  const downloadRoot = () => state.config.destination?.rootFolder || DOWNLOAD_ROOT;
-  const accountSlot = () => location.pathname.match(/\/mail\/u\/(\d+)/)?.[1] || '';
-
-  function sanitizeFolderName(value, fallback = 'Email Thread') {
-    return pathSafety.sanitizePart(value, fallback, 90);
+  function backgroundSleep(ms) {
+    return chrome.runtime.sendMessage({ type: 'SLEEP', ms }).then(() => {}, () => new Promise(resolve => setTimeout(resolve, ms)));
   }
 
-  function sanitizeFileName(value, fallback = 'attachment') {
-    return pathSafety.sanitizePart(value, fallback, 150);
+  /** Chrome slows timers in hidden tabs to about one a minute, so hidden tabs wait on the service worker instead. */
+  function sleep(ms) {
+    if (document.hidden && isAlive()) return backgroundSleep(ms);
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  function opaqueTaskId() {
-    const random = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    return `${state.job?.id || 'job'}:file:${random}`;
-  }
-
-  function parseSizeBytes(value) {
-    const match = String(value || '').match(/([\d.,]+)\s*(B|KB|MB|GB)\b/i);
-    if (!match) return null;
-    const amount = Number(match[1].replace(/,/g, ''));
-    const factor = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3 }[match[2].toUpperCase()];
-    return Number.isFinite(amount) ? Math.round(amount * factor) : null;
-  }
-
-  const gmail = gmailAdapterModule.create({
-    documentRef:document,
-    locationRef:location,
-    historyRef:history,
+  const gmail = gmailAdapter.create({
+    documentRef: document,
+    locationRef: location,
+    historyRef: history,
     sleep,
-    rawText,
-    normalize,
-    sanitizeFileName,
-    parseSizeBytes,
-    includeAllThreadMessages:() => state.options.includeAllThreadMessages,
-    onStage:value => { state.status = value; }
+    isHidden: () => document.hidden,
+    resolveDate: gmailDate.resolve,
+    onStage: value => { state.stage = value; }
   });
 
-  function renderFolderTemplate(meta, messages) {
-    const sender = messages[0]?.from || '';
-    const domain = sender.match(/@([^>\s,;]+)/)?.[1] || 'unknown-domain';
-    const parsedDate = Date.parse(messages[0]?.date || '');
-    const values = {
-      batch: sanitizeFolderName(state.job?.name || 'Export'),
-      index: String(state.matched + 1).padStart(5, '0'),
-      subject: sanitizeFolderName(meta.subject || 'No subject'),
-      senderDomain: state.config.output.redactAddresses ? 'redacted-domain' : sanitizeFolderName(domain),
-      date: Number.isFinite(parsedDate) ? new Date(parsedDate).toISOString().slice(0, 10) : 'unknown-date'
-    };
-    const template = state.config.output.folderTemplate || '{batch}/{index} - {subject}';
-    return pathSafety.sanitizeFolderPath(template.replace(/\{(batch|index|subject|senderDomain|date)\}/g, (_, key) => values[key]), 'Export');
-  }
+  class ContextGone extends Error {}
 
-  function redactEmails(value) {
-    return String(value || '').replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[redacted-email]');
-  }
-
-  async function save() {
-    if (!state.job) return;
-    state.job = {
-        ...state.job,
-        updatedAt: new Date().toISOString(),
-        config: state.config,
-        counters: {
-          ...state.job.counters,
-          inspected: state.scanned,
-          matched: state.matched,
-          rejected: state.skipped,
-          messages: state.messages,
-          downloadsStarted: state.attachments,
-          downloadsFailed: state.attachmentFailures
-        }
-    };
-    await runtimeMessage({ type: 'DB_PUT_JOB', job: state.job });
-    const key = state.tabId ? `${ACTIVE_JOB_KEY}:${state.tabId}` : ACTIVE_JOB_KEY;
-    await chrome.storage.local.set({ [key]: state.job.id });
-  }
-
-  async function load() {
-    const context = await runtimeMessage({ type: 'GET_EXTENSION_CONTEXT' });
-    state.tabId = context?.tabId || null;
-    const tabJobKey = state.tabId ? `${ACTIVE_JOB_KEY}:${state.tabId}` : ACTIVE_JOB_KEY;
-    const obj = await chrome.storage.local.get([STORE_KEY, LEGACY_STORE_KEY, ACTIVE_JOB_KEY, tabJobKey]);
-    const p = obj[STORE_KEY] || obj[LEGACY_STORE_KEY];
-    const activeJobId = obj[tabJobKey] || obj[ACTIVE_JOB_KEY] || p?.activeJobId;
-    if (activeJobId) {
-      const jobId = activeJobId;
-      const found = await runtimeMessage({ type: 'DB_GET_JOB', jobId });
-      if (found?.ok && found.result) {
-        state.job = found.result;
-        state.config = schema.normalizeConfig(state.job.config);
-        const threads = await runtimeMessage({ type: 'DB_GET_THREADS', jobId });
-        const terminal = (threads?.result || []).filter(row => ['matched','rejected'].includes(row.outcome));
-        state.exported = terminal.filter(row => row.outcome === 'matched').map(row => row.record).filter(Boolean);
-        const downloads = await runtimeMessage({ type: 'DB_GET_DOWNLOADS', jobId });
-        const downloadRows = downloads?.result || [];
-        Object.assign(state, {
-          scanned: terminal.length, matched: state.exported.length,
-          skipped: terminal.filter(row => row.outcome === 'rejected').length,
-          messages: state.exported.reduce((total, thread) => total + (thread.messages?.length || 0), 0),
-          attachments: downloadRows.filter(row => ['in_progress','complete','interrupted'].includes(row.state)).length,
-          attachmentFailures: downloadRows.filter(row => ['failed','interrupted'].includes(row.state)).length
-        });
-        state.scannedThreadKeys = new Set(terminal.map(row => row.threadKey));
-        if (['running','pausing'].includes(state.job.status) && state.job.ownerTabId === state.tabId) {
-          state.job = jobMachine.transition(state.job, 'interrupted');
-          state.status = 'Interrupted — ready to resume';
-          await save();
-        }
-        await chrome.storage.local.set({ [tabJobKey]: state.job.id });
-        await chrome.storage.local.remove([STORE_KEY, LEGACY_STORE_KEY, ACTIVE_JOB_KEY].filter(key => key !== tabJobKey));
-        return;
-      }
-    }
-    if (!p) return;
-    state.exported = Array.isArray(p.exported) ? p.exported : [];
-    state.scannedThreadKeys = new Set(Array.isArray(p.scannedThreadKeys) ? p.scannedThreadKeys : []);
-    state.scanned = p.scanned || 0;
-    state.matched = p.matched || state.exported.length;
-    state.skipped = p.skipped || Math.max(0, state.scanned - state.matched);
-    state.messages = p.messages || state.exported.reduce((n, t) => n + (t.messages?.length || 0), 0);
-    state.attachments = p.attachments || 0;
-    state.attachmentFailures = p.attachmentFailures || 0;
-    if (p.options) state.options = { ...state.options, ...p.options };
-    state.config = schema.normalizeConfig(p.config || {
-      attachments: { action: state.options.downloadAttachments === false ? 'metadata' : 'all' }
-    });
-    const jobId = obj[ACTIVE_JOB_KEY] || p.activeJobId;
-    if (jobId) {
-      const found = await runtimeMessage({ type: 'DB_GET_JOB', jobId });
-      if (found?.ok && found.result) state.job = found.result;
-    }
-    if (!state.job && (state.exported.length || state.scannedThreadKeys.size)) {
-      state.job = schema.createJob(state.config, { name: 'Migrated Gmail export', sourceUrl: location.href });
-      state.job.status = 'stopped';
-      for (const thread of state.exported) {
-        await runtimeMessage({ type: 'DB_PUT_THREAD', jobId: state.job.id, threadKey: thread.threadKey, value: { outcome: 'matched', record: thread } });
-      }
-      await save();
-    }
-    await chrome.storage.local.remove([STORE_KEY, LEGACY_STORE_KEY, ACTIVE_JOB_KEY].filter(key => key !== tabJobKey));
-  }
-
-  function getRows() {
-    return gmail.getVisibleThreads();
-  }
-
-  function getRowKey(row) {
-    return gmail.threadKey(row);
-  }
-
-  function isRowSelected(row) {
-    return gmail.isThreadSelected(row);
-  }
-
-  function getNextButton() {
-    return gmail.nextResultsPageControl();
-  }
-
-  function disabled(el) {
-    return gmail.isDisabled(el);
-  }
-
-  async function waitRowsChange(oldSignature) {
-    return gmail.waitRowsChange(oldSignature);
-  }
-
-  function pageSignature() {
-    return gmail.pageSignature();
-  }
-
-  async function waitForListRows(timeout = 15000) {
-    return gmail.waitForList(timeout);
-  }
-
-  function visibleThreadView() {
-    return gmail.isThreadView();
-  }
-
-  async function expandCollapsedMessages() {
-    return gmail.expandCollapsedMessages();
-  }
-
-  async function expandTrimmedContent() {
-    return gmail.expandTrimmedContent();
-  }
-
-  function collectAttachmentTargets() {
-    return gmail.extractAttachments();
-  }
-
-  function extractMessages() {
-    return gmail.extractMessageMetadata();
-  }
-
-  function extractThreadMeta(rowKey) {
-    return gmail.extractThreadMetadata(rowKey);
-  }
-
-  async function runtimeMessage(message) {
-    try {
-      const response = await chrome.runtime.sendMessage(message);
-      if (message?.type?.startsWith('DB_') && response?.ok === false) throw new Error(response.error || `Database action failed: ${message.type}`);
-      return response;
-    } catch (e) {
-      if (message?.type?.startsWith('DB_')) throw e;
-      return { ok: false, error: e?.message || String(e) };
-    }
-  }
-
-  async function logEvent(eventType, detail = {}) {
-    if (!state.job) return;
-    try { await runtimeMessage({ type: 'DB_ADD_EVENT', jobId: state.job.id, eventType, detail }); }
-    catch (error) { console.warn('[InboxFoundry] Event log unavailable', error); }
-  }
-
-  async function clickAndVerifyDownload(target, folder, taskId) {
-    const name = sanitizeFileName(target.name);
-
-    // Prefer an explicit URL when Gmail exposes one. This avoids UI timing issues.
-    if (target.url) {
-      const direct = await runtimeMessage({ type: 'DIRECT_DOWNLOAD', url: target.url, folder, rootFolder: downloadRoot(), fileName: name, jobId: state.job?.id, taskId });
-      if (direct?.ok) return { fileName: name, status: 'started', method: 'direct', downloadId: direct.downloadId };
-      if (direct?.downloadStarted) throw new Error(direct.error || 'The attachment started but its checkpoint failed.');
-    }
-
-    if (!target.element) {
-      return { fileName: name, status: 'failed', method: 'none', error: 'Attachment detected but Gmail exposed no usable download control.' };
-    }
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const prep = await runtimeMessage({ type: 'PREPARE_CLICK_DOWNLOAD', folder, rootFolder: downloadRoot(), fileName: name, ttlMs: 9000, jobId: state.job?.id, taskId });
-      if (!prep?.ok || !prep.token) {
-        throw new Error(prep?.error || 'Could not establish a safe download route. No Gmail download was clicked.');
-      }
-      const token = prep?.token;
+  /** Storage calls survive a service worker restart by retrying; each one is safe to repeat. */
+  async function request(type, payload = {}) {
+    let lastError;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (!isAlive()) throw new ContextGone('InboxFoundry was reloaded. Reopen the panel and resume.');
       try {
-        await gmail.downloadAttachment(target);
-      } catch (e) {
-        await runtimeMessage({ type: 'CLEAR_DOWNLOAD_ROUTE' });
-        if (attempt === 3) return { fileName: name, status: 'failed', method: 'click', error: e?.message || String(e) };
-        continue;
+        const response = await chrome.runtime.sendMessage({ type, ...payload });
+        if (response?.ok === false) throw Object.assign(new Error(response.error || `${type} failed`), { fromStore: true });
+        if (response === undefined) throw new Error('The background worker did not respond.');
+        return response.result;
+      } catch (error) {
+        if (error.fromStore) throw error;
+        if (/context invalidated/i.test(error.message)) throw new ContextGone('InboxFoundry was reloaded. Reopen the panel and resume.');
+        lastError = error;
+        await new Promise(resolve => setTimeout(resolve, 200 * (attempt + 1)));
       }
-
-      let checked = { ok: false, created: false };
-      for (let poll = 0; token && poll < 8 && !checked.created; poll++) {
-        await sleep(350 + attempt * 100);
-        checked = await runtimeMessage({ type: 'CHECK_CLICK_DOWNLOAD', token });
-      }
-      await runtimeMessage({ type: 'CLEAR_DOWNLOAD_ROUTE' });
-      if (checked?.created) {
-        if (checked.persisted === false) throw new Error(checked.persistenceError || 'The attachment started but its checkpoint failed.');
-        return { fileName: checked.fileName || name, status: 'started', method: 'click', downloadId: checked.downloadId };
-      }
-      await sleep(300 * (2 ** (attempt - 1)));
     }
-
-    return { fileName: name, status: 'failed', method: 'click', error: 'No Chrome download event detected after three attempts.' };
+    throw lastError;
   }
 
-  async function downloadAttachmentsForThread(folder, matchingMessageIndexes = null) {
-    const action = state.config.attachments.action;
-    const allowedMessages = matchingMessageIndexes ? new Set(matchingMessageIndexes) : null;
-    const targets = collectAttachmentTargets().filter(target => {
-      if (allowedMessages && !allowedMessages.has(target.messageIndex)) return false;
-      const decision = filterEngine.attachmentMatches({ fileName: target.name, sizeBytes: target.sizeBytes, inline: !!target.inline }, state.config.attachments);
-      if (action === 'matching') return decision.matched;
-      if (action === 'all') return !decision.reasons.some(reason => ['inline-file', 'common-clutter-name', 'tiny-image'].includes(reason));
-      return true;
-    });
-    if (action === 'none' || action === 'metadata') {
-      return targets.map(t => ({ fileName: t.name, sizeBytes: t.sizeBytes, messageIndex: t.messageIndex, status: action === 'none' ? 'ignored' : 'metadata-only' }));
-    }
-
-    const results = [];
-    for (let i = 0; i < targets.length; i++) {
-      state.status = `Downloading file ${i + 1}/${targets.length}…`;
-      const messageFolder = `${folder}/Message-${String(targets[i].messageIndex).padStart(3, '0')}`;
-      if (state.attachments >= state.config.attachments.maxDownloads) {
-        results.push({ fileName: targets[i].name, messageIndex: targets[i].messageIndex, status: 'limit-reached' });
-        continue;
-      }
-      const taskId = opaqueTaskId();
-      await runtimeMessage({ type: 'DB_PUT_DOWNLOAD', value: { id: taskId, jobId: state.job?.id, fileName: targets[i].name, folder: messageFolder, state: 'queued', queuedAt: new Date().toISOString() } });
-      const result = await clickAndVerifyDownload(targets[i], messageFolder, taskId);
-      results.push({ ...result, sizeBytes: targets[i].sizeBytes, messageIndex: targets[i].messageIndex });
-      if (result.status === 'started') state.attachments++;
-      else {
-        state.attachmentFailures++;
-        await runtimeMessage({ type: 'DB_PUT_DOWNLOAD', value: { id: taskId, jobId: state.job?.id, fileName: targets[i].name, folder: messageFolder, state: 'failed', error: result.error, finishedAt: new Date().toISOString() } });
-      }
-      await sleep(300);
-    }
-    await runtimeMessage({ type: 'CLEAR_DOWNLOAD_ROUTE' });
-    return results;
+  const accountSlot = () => location.pathname.match(/\/mail\/u\/(\d+)/)?.[1] || '0';
+  const accountEmail = () => document.title.match(/[\w.+%-]+@[\w.-]+\.[a-z]{2,}/i)?.[0]?.toLowerCase() || '';
+  const currentBase = () => gmailAdapter.parseView(location.hash).base;
+  /** The hash of the list page behind any open conversation. */
+  function currentListHash() {
+    const { base, page } = gmailAdapter.parseView(location.hash);
+    return page > 1 ? `${base}/p${page}` : base;
   }
 
-  async function openRow(row) {
-    return gmail.openThread(row);
+  function logEvent(eventType, detail = {}) {
+    if (!state.job) return Promise.resolve();
+    return request('ADD_EVENT', { jobId: state.job.id, eventType, detail }).catch(() => {});
   }
 
-  async function goBackToList(listUrl, listHash) {
-    return gmail.returnToSearchResults(listUrl, listHash);
+  async function saveJob(patch = {}) {
+    state.job = { ...state.job, ...patch };
+    await request('PUT_JOB', { job: state.job });
   }
 
-  async function captureOpenedThread(rowKey) {
-    await expandCollapsedMessages();
-    await expandTrimmedContent();
-    await sleep(250);
+  function setStatus(next, detail = {}) {
+    state.job = jobMachine.transition(state.job, next, detail);
+  }
 
-    const meta = extractThreadMeta(rowKey);
-    let messages = extractMessages();
-    if (!messages.length) {
-      state.status = 'Waiting for conversation content…';
-      await sleep(1200);
-      await expandCollapsedMessages();
-      await expandTrimmedContent();
-      messages = extractMessages();
-    }
-    if (!messages.length) {
-      throw new Error('Gmail thread opened but no message body could be captured. Thread was NOT marked processed.');
-    }
+  function redact(value) {
+    return String(value ?? '').replace(EMAIL_PATTERN, '[redacted-email]');
+  }
 
-    const evaluation = filterEngine.evaluateThread(meta, messages, state.config);
-    if (!evaluation.matched) {
-      state.status = `Skipped: ${evaluation.reasons.join(', ')}`;
-      await runtimeMessage({
-        type: 'DB_PUT_THREAD', jobId: state.job.id, threadKey: rowKey,
-        value: { outcome: 'rejected', subject: meta.subject, reasons: evaluation.reasons, inspectedAt: new Date().toISOString() }
+  function renderFolder(meta, messages, ordinal) {
+    const { output } = state.config;
+    const sender = messages[0]?.from || '';
+    const iso = messages[0]?.dateIso;
+    const values = {
+      index: String(ordinal).padStart(5, '0'),
+      subject: pathSafety.sanitizePart(output.redactAddresses ? redact(meta.subject) : meta.subject, 'No subject'),
+      senderDomain: output.redactAddresses ? 'redacted-domain' : pathSafety.sanitizePart(sender.split('@')[1], 'unknown-domain'),
+      date: iso ? iso.slice(0, 10) : 'unknown-date'
+    };
+    const rendered = String(output.folderTemplate || '{index} - {subject}')
+      .replace(/\{(index|subject|senderDomain|date)\}/g, (_, key) => values[key]);
+    return `${state.job.name}/${rendered}`;
+  }
+
+  function shapeMessage(message) {
+    const { output } = state.config;
+    const scrub = output.redactAddresses ? redact : value => value;
+    const full = output.contentMode === 'full';
+    return {
+      index: message.index,
+      messageId: output.includeInternalIds ? message.messageId : undefined,
+      from: scrub(message.from),
+      fromName: output.redactAddresses ? undefined : message.fromName || undefined,
+      recipients: (message.recipients || []).map(scrub),
+      date: scrub(message.date),
+      dateIso: message.dateIso,
+      dateSource: message.dateSource,
+      rawHeaderText: scrub(message.rawHeaderText),
+      bodyTextRaw: full ? scrub(message.bodyTextRaw) : undefined,
+      bodyHtmlRaw: full && output.includeRawHtml ? scrub(message.bodyHtmlRaw) : undefined,
+      attachments: message.attachments.map(item => ({ fileName: item.fileName, sizeBytes: item.sizeBytes }))
+    };
+  }
+
+  function attachmentRows(threadId, threadSeq, threadKey, subject, url, folder, evaluation, messageFilter) {
+    const { attachments: rules, destination } = state.config;
+    return evaluation.attachmentEvaluations
+      .filter(item => messageFilter(item.attachment.messageIndex))
+      .map(item => {
+        const { attachment } = item;
+        let fileState = 'discovered';
+        if (rules.action === 'none') fileState = 'skipped';
+        else if (!attachment.url && !attachment.canClick) fileState = 'unavailable';
+        const clutter = item.reasons.some(reason => ['tiny-image', 'common-clutter-name'].includes(reason));
+        const selected = fileState === 'discovered' && (rules.action === 'matching' ? item.matched : !clutter);
+        return {
+          id: `${threadId}:a:${attachment.messageIndex}:${attachment.ordinal}`,
+          jobId: state.job.id,
+          seq: state.attachmentSeq++,
+          threadId,
+          threadSeq,
+          threadKey,
+          threadUrl: url,
+          subject,
+          messageIndex: attachment.messageIndex,
+          ordinal: attachment.ordinal,
+          fileName: attachment.fileName,
+          sizeBytes: attachment.sizeBytes ?? null,
+          url: attachment.url,
+          driveLink: !!attachment.driveLink,
+          classification: item.classification,
+          matched: item.matched,
+          reasons: item.reasons,
+          selected,
+          state: fileState,
+          rootFolder: destination.rootFolder,
+          folder: `${folder}/Message-${String(attachment.messageIndex).padStart(3, '0')}`
+        };
       });
-      state.scannedThreadKeys.add(rowKey);
-      state.scanned++;
-      state.skipped++;
-      await logEvent('thread-rejected', { ordinal: state.scanned, reasons: evaluation.reasons });
-      try { await save(); } catch (error) { error.threadCommitted = true; throw error; }
-      return { matched: false };
+  }
+
+  function threadBase(rowInfo, identity, seq) {
+    const threadKey = identity.key;
+    return {
+      id: `${state.job.id}:${threadKey}`,
+      jobId: state.job.id,
+      seq,
+      threadKey,
+      rowKey: rowInfo?.key || threadKey,
+      permId: identity.permId,
+      weakIdentity: identity.weak,
+      wasUnread: !!rowInfo?.unread
+    };
+  }
+
+  function markDone(...keys) {
+    for (const key of keys) if (key) state.done.add(key);
+  }
+
+  /** Returns 'matched', 'rejected', 'unchanged', or 'duplicate'. Throws if the conversation can't be captured. */
+  async function captureOpenThread(rowInfo) {
+    state.stage = 'Reading the conversation…';
+    await gmail.expandThread();
+    let view = gmail.extractThread();
+    if (!view.messages.length) {
+      await sleep(1200);
+      await gmail.expandThread();
+      view = gmail.extractThread();
+    }
+    if (!view.messages.length) throw new Error('No message body could be read from this conversation.');
+
+    const strongRowKey = rowInfo?.strong ? rowInfo.key : null;
+    if (view.threadId && state.done.has(view.threadId)) {
+      markDone(rowInfo?.key);
+      // A row with its own Gmail ID should open its own conversation. If it didn't, say so: mail may be missing.
+      if (rowInfo?.strong) {
+        await saveJob({ counters: { ...state.job.counters, repeatedViews: (state.job.counters.repeatedViews || 0) + 1 } });
+        await logEvent('row-opened-captured-conversation');
+      }
+      return 'duplicate';
+    }
+    const identity = {
+      key: strongRowKey || view.threadId || rowInfo?.key || `open-${Date.now()}`,
+      permId: view.threadId,
+      weak: !strongRowKey && !view.threadId
+    };
+    const counters = { ...state.job.counters };
+    counters.inspected++;
+    const failedBefore = state.attempts.has(rowInfo?.key);
+    if (failedBefore) {
+      counters.failed = Math.max(0, counters.failed - 1);
+      state.attempts.delete(rowInfo.key);
+    }
+    const removeThreadId = failedBefore && rowInfo.key !== identity.key ? `${state.job.id}:${rowInfo.key}` : undefined;
+    if (rowInfo?.unread) counters.unread++;
+
+    const lastMessageId = view.messages.at(-1).messageId;
+    const previous = state.ledger.get(identity.key) || state.ledger.get(view.threadId);
+    const seq = state.seq++;
+    const base = threadBase(rowInfo, identity, seq);
+    const summary = {
+      subject: view.subject,
+      from: view.messages[0].from,
+      date: view.messages[0].dateIso,
+      messageCount: view.messages.length,
+      lastMessageId
+    };
+
+    if (previous && previous.messageCount === view.messages.length && (!lastMessageId || previous.lastMessageId === lastMessageId)) {
+      counters.unchanged++;
+      await request('PUT_THREAD_BUNDLE', { bundle: { removeThreadId, thread: { ...base, outcome: 'unchanged', ...summary, reasons: ['already-exported'] } } });
+      markDone(identity.key, rowInfo?.key, view.threadId);
+      await saveJob({ counters });
+      return 'unchanged';
     }
 
-    state.status = `Saving match ${state.matched + 1} (${messages.length} message${messages.length === 1 ? '' : 's'})…`;
+    const evaluation = filterEngine.evaluateThread(view, view.messages, state.config);
+    if (!evaluation.matched) {
+      counters.rejected++;
+      state.stage = 'Did not match; moving on…';
+      const privateSummary = state.config.output.redactAddresses
+        ? { ...summary, subject: redact(summary.subject), from: redact(summary.from) } : summary;
+      await request('PUT_THREAD_BUNDLE', { bundle: { removeThreadId, thread: { ...base, outcome: 'rejected', ...privateSummary, reasons: evaluation.reasons } } });
+      markDone(identity.key, rowInfo?.key, view.threadId);
+      await saveJob({ counters });
+      return 'rejected';
+    }
 
-    const selectedMessages = state.config.email.threadMode === 'matching-messages'
-      ? messages.filter(message => evaluation.matchedMessageIndexes.includes(message.index))
-      : messages;
+    const { email, output } = state.config;
+    const onlyMatching = email.threadMode === 'matching-messages';
+    const included = onlyMatching ? new Set(evaluation.matchedMessageIndexes) : null;
+    const keepMessage = index => !included || included.has(index);
+    const kept = view.messages.filter(message => keepMessage(message.index));
+    const ordinal = counters.matched + 1;
+    const folder = renderFolder(view, kept, ordinal);
+    const warnings = [];
+    if (view.messagesNotExpanded > 0) warnings.push(`messages-not-readable:${view.messagesNotExpanded}`);
+    if (rowInfo?.countHint && rowInfo.countHint > view.messages.length) warnings.push(`gmail-shows-${rowInfo.countHint}-messages-captured-${view.messages.length}`);
+    if (evaluation.reasons.includes('date-unverified') || view.messages.some(message => message.dateSource === 'unknown')) warnings.push('date-unverified');
+    if (identity.weak) warnings.push('no-gmail-thread-id');
+    if (warnings.some(item => item.startsWith('messages-') || item.startsWith('gmail-shows'))) counters.incomplete++;
 
-    const folder = renderFolderTemplate(meta, selectedMessages);
-    const attachmentResults = await downloadAttachmentsForThread(
-      folder,
-      state.config.email.threadMode === 'matching-messages' ? evaluation.matchedMessageIndexes : null
-    );
-
-    // Attach per-file download result back to its individual conversation message.
-    const enrichedMessages = selectedMessages.map((message) => ({
-      ...message,
-      messageId: state.config.output.includeInternalIds ? message.messageId : undefined,
-      from: state.config.output.redactAddresses ? redactEmails(message.from) : message.from,
-      recipients: state.config.output.redactAddresses ? (message.recipients || []).map(redactEmails) : message.recipients,
-      rawHeaderText: state.config.output.redactAddresses ? redactEmails(message.rawHeaderText) : message.rawHeaderText,
-      bodyTextRaw: state.config.output.contentMode === 'full' ? message.bodyTextRaw : undefined,
-      bodyTextNormalized: state.config.output.contentMode === 'full' ? message.bodyTextNormalized : undefined,
-      bodyHtmlRaw: state.config.output.contentMode === 'full' && state.config.output.includeRawHtml ? message.bodyHtmlRaw : undefined,
-      attachmentFolder: `Downloads/${downloadRoot()}/${folder}/Message-${String(message.index).padStart(3, '0')}`,
-      attachmentResults: attachmentResults.filter(r => r.messageIndex === message.index)
-    }));
-
+    const scrub = output.redactAddresses ? redact : value => value;
+    const subject = scrub(view.subject);
     const record = {
-      ...meta,
-      recordId: `record-${String(state.matched + 1).padStart(5, '0')}`,
-      threadKey: state.config.output.includeInternalIds ? meta.threadKey : undefined,
-      url: state.config.output.includeGmailUrls ? meta.url : undefined,
-      captureMode: state.config.email.threadMode,
-      attachmentFolder: `Downloads/${downloadRoot()}/${folder}`,
-      exportedAt: new Date().toISOString(),
+      recordId: `record-${String(ordinal).padStart(6, '0')}`,
+      threadKey: output.includeInternalIds ? identity.key : undefined,
+      subject,
+      url: output.includeGmailUrls && !output.redactAddresses ? view.url : undefined,
+      captureMode: email.threadMode,
+      folder,
+      capturedAt: new Date().toISOString(),
+      wasUnread: !!rowInfo?.unread,
+      warnings,
       matchEvidence: {
         reasons: evaluation.reasons,
         matchingMessageIndexes: evaluation.matchedMessageIndexes,
-        matchingAttachments: evaluation.matchedAttachments.map(item => ({ fileName: item.fileName || item.name, messageIndex: item.messageIndex }))
+        matchingAttachments: evaluation.matchedAttachments.map(item => ({ fileName: item.fileName, messageIndex: item.messageIndex }))
       },
-      attachmentSelection: evaluation.attachmentEvaluations.map(item => ({
-        fileName: item.attachment.fileName || item.attachment.name,
-        messageIndex: item.attachment.messageIndex,
-        sizeBytes: item.attachment.sizeBytes ?? null,
-        matched: item.matched,
-        reasons: item.reasons,
-        classification: item.classification
-      })),
-      rawThreadText: state.config.output.contentMode === 'full' ? enrichedMessages.map((m, i) => `--- MESSAGE ${i + 1} ---\n${m.bodyTextRaw}`).join('\n\n') : undefined,
-      messages: enrichedMessages,
-      attachmentResults
+      messages: kept.map(shapeMessage)
     };
-    await runtimeMessage({
-      type: 'DB_PUT_THREAD_BUNDLE', jobId: state.job.id, threadKey: rowKey, value: { outcome: 'matched', record },
-      messages: enrichedMessages,
-      attachments: record.attachmentSelection
+    const threadId = base.id;
+    const attachments = attachmentRows(threadId, seq, identity.key, subject, view.url, folder, evaluation, keepMessage);
+    counters.matched++;
+    counters.messages += kept.length;
+    await request('PUT_THREAD_BUNDLE', {
+      bundle: {
+        removeThreadId,
+        thread: {
+          ...base,
+          outcome: 'matched',
+          ...summary,
+          subject,
+          from: scrub(summary.from),
+          attachmentCount: attachments.length,
+          reasons: evaluation.reasons,
+          warnings,
+          excluded: false,
+          url: view.url
+        },
+        record: { id: threadId, jobId: state.job.id, seq, record },
+        attachments
+      }
     });
-    state.scannedThreadKeys.add(rowKey);
-    state.scanned++;
-    state.exported.push(record);
-    state.matched++;
-    state.messages += enrichedMessages.length;
-    await logEvent('thread-exported', { ordinal: state.scanned, messageCount: enrichedMessages.length, attachmentResultCount: attachmentResults.length });
-    try { await save(); } catch (error) { error.threadCommitted = true; throw error; }
-    return { matched: true, record };
+    markDone(identity.key, rowInfo?.key, view.threadId);
+    await saveJob({ counters, nextAttachmentSeq: state.attachmentSeq, nextSeq: state.seq });
+    return 'matched';
   }
 
-  async function processRow(row, rowKey) {
-    const listUrl = location.href;
-    const listHash = location.hash;
-    state.status = `Opening ${state.scanned + 1}…`;
-    const ok = await openRow(row);
-    if (!ok) {
-      await runtimeMessage({ type: 'DB_PUT_THREAD', jobId: state.job.id, threadKey: rowKey, value: { outcome: 'retryable', error: 'Could not open a Gmail thread.', attemptedAt: new Date().toISOString() } });
-      throw new Error('Could not open a Gmail thread.');
+  async function recordFailure(rowInfo, error) {
+    const key = rowInfo?.key || `open-${Date.now()}`;
+    const attempts = (state.attempts.get(key) || 0) + 1;
+    state.attempts.set(key, attempts);
+    const seq = state.seq++;
+    await request('PUT_THREAD_BUNDLE', {
+      bundle: {
+        thread: {
+          id: `${state.job.id}:${key}`,
+          jobId: state.job.id,
+          seq,
+          threadKey: key,
+          rowKey: key,
+          outcome: 'failed',
+          attempts,
+          wasUnread: !!rowInfo?.unread,
+          error: String(error?.message || error)
+        }
+      }
+    });
+    markDone(key);
+    const counters = { ...state.job.counters, failed: state.job.counters.failed + 1 };
+    await saveJob({ counters, nextSeq: state.seq });
+    await logEvent('thread-failed', { ordinal: counters.inspected + counters.failed, attempts, code: String(error?.message || error).slice(0, 120) });
+  }
+
+  /** A single unreadable conversation is recorded and skipped, so it can never block everything after it. */
+  async function processRow(rowInfo, listHash) {
+    state.stage = `Opening conversation ${state.job.counters.inspected + 1}…`;
+    let opened = await gmail.openThread(rowInfo.element);
+    if (!opened) {
+      await gmail.returnToList(listHash);
+      await sleep(800);
+      const again = gmail.listRows(state.page).find(row => row.key === rowInfo.key);
+      if (again) opened = await gmail.openThread(again.element);
     }
-    await sleep(500);
+    if (!opened) {
+      await recordFailure(rowInfo, new Error('The conversation did not open.'));
+      await gmail.returnToList(listHash);
+      return false;
+    }
+    let succeeded = true;
     try {
-      await captureOpenedThread(rowKey);
+      await captureOpenThread(rowInfo);
     } catch (error) {
-      if (!error.threadCommitted) await runtimeMessage({ type: 'DB_PUT_THREAD', jobId: state.job.id, threadKey: rowKey, value: { outcome: 'retryable', error: error?.message || String(error), attemptedAt: new Date().toISOString() } });
-      throw error;
+      if (error instanceof ContextGone || error.fromStore) throw error;
+      await recordFailure(rowInfo, error);
+      succeeded = false;
     }
-    await goBackToList(listUrl, listHash);
+    await gmail.returnToList(listHash);
+    return succeeded;
   }
 
-  async function run() {
-    if (state.running) return;
+  async function loadProgress() {
+    state.done = new Set();
+    state.attempts = new Map();
+    let afterSeq = -1;
+    let maxSeq = -1;
+    for (;;) {
+      const rows = await request('THREAD_PAGE', { jobId: state.job.id, afterSeq, limit: 2000 });
+      if (!rows.length) break;
+      for (const row of rows) {
+        maxSeq = Math.max(maxSeq, row.seq);
+        if (row.outcome === 'failed') {
+          state.attempts.set(row.threadKey, row.attempts || 1);
+          if ((row.attempts || 1) >= MAX_THREAD_ATTEMPTS) markDone(row.threadKey);
+        } else markDone(row.threadKey, row.rowKey, row.permId);
+      }
+      afterSeq = rows.at(-1).seq;
+      if (rows.length < 2000) break;
+    }
+    state.seq = Math.max(state.job.nextSeq || 0, maxSeq + 1);
+    state.attachmentSeq = state.job.nextAttachmentSeq || 0;
+  }
+
+  async function loadLedger() {
+    state.ledger = new Map();
+    if (!state.config.source.incremental) return;
+    const entries = await request('LEDGER_FOR_SCOPE', { scope: schema.ledgerScope(state.job) });
+    for (const entry of entries) state.ledger.set(entry.threadKey, entry);
+  }
+
+  function isUnreadView() {
+    const base = gmailAdapter.comparableBase(state.job.sourceBase);
+    return /(^|[\s/-])(is|label):unread\b/.test(base);
+  }
+
+  function startHeartbeat() {
+    const beat = () => {
+      if (!state.running || !state.job) return;
+      const patch = { ownerTabId: state.tabId, leaseExpiresAt: new Date(Date.now() + LEASE_MS).toISOString() };
+      state.job = { ...state.job, ...patch };
+      request('PATCH_JOB', { jobId: state.job.id, patch }).catch(error => {
+        state.stage = `Storage problem: ${error.message}`;
+        state.stopRequested = true;
+      });
+    };
+    beat();
+    return setInterval(beat, 30000);
+  }
+
+  function addPartialReason(reason) {
+    if (!state.job.partialReasons.includes(reason)) state.job.partialReasons = [...state.job.partialReasons, reason];
+  }
+
+  function nextUnprocessedRow(rows) {
+    const { mode, selectedThreadKeys, incremental } = state.config.source;
+    for (const row of rows) {
+      if (state.done.has(row.key)) continue;
+      if (mode === 'selected' && !selectedThreadKeys.includes(row.key)) continue;
+      if ((state.attempts.get(row.key) || 0) >= MAX_THREAD_ATTEMPTS) continue;
+      if (incremental && row.lastMessageId && state.ledger.get(row.key)?.lastMessageId === row.lastMessageId) {
+        markDone(row.key);
+        state.job.counters = { ...state.job.counters, unchanged: state.job.counters.unchanged + 1 };
+        continue;
+      }
+      return row;
+    }
+    return null;
+  }
+
+  /** Scans the list until the end, a limit, or Stop. Every pass awaits a real timer, so Gmail stays responsive. */
+  async function scanList() {
+    const { source } = state.config;
+    const sourceBase = gmailAdapter.comparableBase(state.job.sourceBase);
+    let consecutiveFailures = 0;
+    let sweeps = 0;
+    let inspectedAtSweep = state.job.counters.inspected;
+    let sawRows = false;
+
+    for (;;) {
+      await sleep(40);
+      if (state.stopRequested) return 'stopped';
+      if (state.job.accountSlot !== accountSlot()) throw new Error('The active Gmail account changed. Return to the original account and resume.');
+      if (state.job.counters.matched >= source.maxMatchedThreads) {
+        addPartialReason('limit-matched');
+        return 'limit';
+      }
+      if (state.job.counters.inspected >= source.maxInspectedThreads) {
+        addPartialReason('limit-inspected');
+        return 'limit';
+      }
+      if (gmail.isThreadOpen() && !gmail.listRows(state.page).length) await gmail.returnToList(currentListHash());
+      if (gmailAdapter.comparableBase(currentBase()) !== sourceBase) throw Object.assign(new Error('Gmail moved to a different list while scanning. Nothing was mixed in; resume to continue.'), { interrupted: true });
+
+      state.page = gmailAdapter.parseView(location.hash).page;
+      const hasRows = await gmail.waitForRows(sawRows ? 15000 : 8000);
+      if (hasRows) sawRows = true;
+      // Rows that were there and have gone are not proof of the end: the list may just be slow or broken.
+      // An unread search is the exception, because reading mail really does empty it.
+      if (!hasRows && sawRows && !isUnreadView()) {
+        addPartialReason('pagination-end-unconfirmed');
+        await logEvent('list-disappeared', { page: state.page });
+        return 'finished';
+      }
+      const row = hasRows ? nextUnprocessedRow(gmail.listRows(state.page)) : null;
+      if (row) {
+        const succeeded = await processRow(row, currentListHash());
+        consecutiveFailures = succeeded ? 0 : consecutiveFailures + 1;
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          throw new Error(`${MAX_CONSECUTIVE_FAILURES} conversations in a row could not be read. Gmail may have changed or you may be signed out. Run "Check Gmail compatibility", then resume.`);
+        }
+        await sleep(source.pacingMs);
+        continue;
+      }
+      if (source.mode === 'current-page' || source.mode === 'selected') return 'finished';
+
+      state.stage = 'Moving to the next page…';
+      const result = hasRows ? await gmail.nextPage() : { status: 'end', method: 'empty-list' };
+      if (result.status === 'advanced') {
+        await logEvent('page-advanced', { method: result.method });
+        continue;
+      }
+      if (result.status === 'unconfirmed') {
+        addPartialReason('pagination-end-unconfirmed');
+        await logEvent('pagination-unconfirmed');
+        return 'finished';
+      }
+      // Reading unread mail removes it from an unread search, which shifts results, so sweep until nothing new appears.
+      if (isUnreadView() && state.job.counters.inspected > inspectedAtSweep && sweeps < MAX_UNREAD_SWEEPS) {
+        sweeps++;
+        inspectedAtSweep = state.job.counters.inspected;
+        state.stage = 'Checking the unread list again…';
+        location.hash = state.job.sourceBase;
+        await sleep(1200);
+        continue;
+      }
+      if (!sawRows) addPartialReason('no-rows-found');
+      return 'finished';
+    }
+  }
+
+  async function runScan() {
     state.running = true;
     state.stopRequested = false;
-    state.status = 'Scanning…';
-    let heartbeat = null;
+    state.stage = 'Scanning…';
+    const heartbeat = startHeartbeat();
     try {
-      if (state.job.status === 'draft') state.job = jobMachine.transition(state.job, 'validating');
-      state.job = jobMachine.transition(state.job, 'running', { ownerTabId: state.tabId, leaseExpiresAt: new Date(Date.now() + 90000).toISOString() });
-      await save();
-      await logEvent('job-started', { resumed: !!state.job.stoppedAt, scopeMode: state.config.source.mode });
-      heartbeat = setInterval(() => {
-        if (!state.running || !state.job) return;
-        state.job.leaseExpiresAt = new Date(Date.now() + 90000).toISOString();
-        runtimeMessage({ type: 'DB_PATCH_JOB', jobId: state.job.id, patch: { ownerTabId: state.tabId, leaseExpiresAt: state.job.leaseExpiresAt } })
-          .catch(error => { state.status = `Storage heartbeat failed: ${error.message}`; state.stopRequested = true; });
-      }, 30000);
+      setStatus('running', { phase: 'scan', ownerTabId: state.tabId, lastError: null, stopReason: null });
+      state.job.partialReasons = [];
+      await saveJob();
+      await logEvent('scan-started', { mode: state.config.source.mode });
+      await loadProgress();
+      await loadLedger();
+
+      let outcome;
       if (state.config.source.mode === 'current-thread') {
-        if (!visibleThreadView()) throw new Error('Open the Gmail conversation you want to export, then start the current-thread job.');
-        const key = extractThreadMeta('current-thread').threadKey;
-        if (!state.scannedThreadKeys.has(key)) await captureOpenedThread(key);
+        if (!gmail.isThreadOpen()) throw new Error('Open the conversation you want to save, then start.');
+        await captureOpenThread(null);
+        outcome = 'finished';
+      } else {
+        outcome = await scanList();
       }
-      while (!state.stopRequested && state.config.source.mode !== 'current-thread') {
-        if (state.job.accountSlot !== accountSlot()) throw new Error('The active Gmail account changed. Return to the original account before resuming this batch.');
-        if (state.matched >= state.config.source.maxMatchedThreads) {
-          state.status = `Finished at the ${state.config.source.maxMatchedThreads}-thread Free safety limit`;
+
+      const { counters } = state.job;
+      if (counters.failed > 0) addPartialReason('threads-failed');
+      if (counters.incomplete > 0) addPartialReason('threads-incomplete');
+      if (counters.repeatedViews > 0) addPartialReason('rows-opened-same-conversation');
+      if (outcome === 'stopped' || outcome === 'limit') {
+        if (state.job.status === 'running') setStatus('pausing');
+        setStatus('stopped', { stopReason: outcome === 'limit' ? 'limit' : 'user', leaseExpiresAt: null });
+        state.stage = outcome === 'limit' ? 'Safety limit reached. Raise it and resume to continue.' : 'Stopped safely. Everything captured so far is kept.';
+      } else {
+        setStatus('ready', { leaseExpiresAt: null });
+        state.stage = 'Scan finished. Review the results, then save.';
+      }
+      await logEvent('scan-finished', { outcome, ...counters, partialReasons: state.job.partialReasons });
+    } catch (error) {
+      if (error instanceof ContextGone) return;
+      console.error('[InboxFoundry]', error);
+      state.stage = error.message;
+      setStatus(error.interrupted ? 'interrupted' : 'failed', { lastError: error.message, leaseExpiresAt: null });
+      await logEvent('scan-error', { message: error.message });
+    } finally {
+      clearInterval(heartbeat);
+      state.running = false;
+      if (isAlive()) await saveJob().catch(error => { state.stage = `Could not save the job: ${error.message}`; });
+    }
+  }
+
+  async function ensureTabId() {
+    if (state.tabId == null) state.tabId = (await request('GET_CONTEXT')).tabId;
+  }
+
+  async function nextBatch() {
+    const stored = await chrome.storage.local.get(BATCH_COUNTER_KEY);
+    const number = Number(stored[BATCH_COUNTER_KEY]) || 1;
+    await chrome.storage.local.set({ [BATCH_COUNTER_KEY]: number + 1 });
+    return number;
+  }
+
+  async function assertNoOtherLiveJob(exceptId) {
+    const jobs = await request('LIST_JOBS');
+    const now = Date.now();
+    for (const job of jobs) {
+      if (job.id === exceptId || !jobMachine.isActive(job)) continue;
+      if (Date.parse(job.leaseExpiresAt || 0) > now && job.ownerTabId !== state.tabId) {
+        throw new Error(`${job.name} is running in another Gmail tab. Stop it before starting another.`);
+      }
+      await request('PATCH_JOB', { jobId: job.id, patch: { status: 'interrupted', leaseExpiresAt: null, lastError: 'The Gmail tab stopped responding.' } });
+    }
+  }
+
+  async function settleAfterNavigation(previousSignature) {
+    await gmail.waitFor(() => {
+      const signature = gmail.listSignature();
+      return signature && signature !== previousSignature ? true : null;
+    }, 6000, 150);
+    await sleep(300);
+  }
+
+  async function startScan(rawConfig) {
+    if (state.running) throw new Error('A job is already running in this Gmail tab.');
+    await ensureTabId();
+    const consent = await chrome.storage.local.get(CONSENT_KEY);
+    if (consent[CONSENT_KEY] !== true) throw new Error('Please read and accept the notice in the InboxFoundry panel first.');
+    await assertNoOtherLiveJob(null);
+
+    const config = schema.normalizeConfig(rawConfig);
+    const { mode, gmailQuery } = config.source;
+    if (mode === 'current-thread' && !gmail.isThreadOpen()) throw new Error('Open the conversation you want to save, then start.');
+    if (mode === 'selected') {
+      if (gmail.isThreadOpen()) throw new Error('Go back to the Gmail list to use selected rows.');
+      config.source.selectedThreadKeys = gmail.listRows(1).filter(row => row.selected).map(row => row.key);
+      if (!config.source.selectedThreadKeys.length) throw new Error('Tick at least one conversation in Gmail first.');
+    } else if (mode !== 'current-thread') {
+      if (gmailQuery) {
+        const before = gmail.listSignature();
+        const hashBefore = location.hash;
+        gmail.search(gmailQuery);
+        state.stage = 'Opening your search in Gmail…';
+        if (location.hash !== hashBefore) await settleAfterNavigation(before);
+      } else if (gmail.isThreadOpen()) {
+        await gmail.returnToList(currentListHash());
+      }
+    }
+
+    const batchNumber = await nextBatch();
+    const date = new Date().toISOString().slice(0, 10);
+    state.config = config;
+    state.page = 1;
+    state.job = schema.createJob(config, {
+      name: `Batch ${String(batchNumber).padStart(3, '0')} ${date}`,
+      batchNumber,
+      sourceUrl: location.href,
+      sourceBase: currentBase(),
+      accountSlot: accountSlot(),
+      accountEmail: accountEmail(),
+      ownerTabId: state.tabId
+    });
+    await saveJob();
+    return state.job.id;
+  }
+
+  async function loadJob(jobId) {
+    const job = await request('GET_JOB', { jobId });
+    if (!job) throw new Error('That batch no longer exists.');
+    state.job = job;
+    state.config = schema.normalizeConfig(job.config);
+  }
+
+  async function prepareResume(jobId, overrides = {}) {
+    if (state.running) throw new Error('A job is already running in this Gmail tab.');
+    await ensureTabId();
+    await loadJob(jobId);
+    if (!jobMachine.isResumable(state.job) && !jobMachine.isActive(state.job)) throw new Error('This batch has nothing to resume.');
+    await assertNoOtherLiveJob(jobId);
+    if (state.job.accountSlot !== accountSlot()) throw new Error('This batch belongs to another Gmail account. Switch to that account first.');
+    if (jobMachine.isActive(state.job)) state.job = { ...state.job, status: 'interrupted' };
+    const source = state.config.source;
+    if (overrides.maxMatchedThreads) source.maxMatchedThreads = Math.max(source.maxMatchedThreads, Number(overrides.maxMatchedThreads));
+    if (overrides.maxInspectedThreads) source.maxInspectedThreads = Math.max(source.maxInspectedThreads, Number(overrides.maxInspectedThreads));
+    state.job.config = state.config;
+    if (source.mode !== 'current-thread' && gmailAdapter.comparableBase(currentBase()) !== gmailAdapter.comparableBase(state.job.sourceBase)) {
+      const before = gmail.listSignature();
+      location.hash = state.job.sourceBase;
+      await settleAfterNavigation(before);
+    } else if (source.mode !== 'current-thread' && gmail.isThreadOpen()) {
+      await gmail.returnToList(state.job.sourceBase);
+    }
+  }
+
+  // ---- Attachment downloads ----
+
+  async function clickDownload(attachment) {
+    const control = gmail.attachmentControlFor(attachment.messageIndex, attachment.ordinal);
+    if (!control) return { ok: false, error: 'Gmail shows no download control for this file.' };
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const route = await request('PREPARE_CLICK_DOWNLOAD', { attachmentId: attachment.id, ttlMs: 10000 });
+      gmail.press(control);
+      let created = false;
+      for (let poll = 0; poll < 12 && !created; poll++) {
+        await sleep(400);
+        created = (await request('CHECK_CLICK_DOWNLOAD', { token: route.token })).created;
+      }
+      await request('CLEAR_DOWNLOAD_ROUTE');
+      if (created) return { ok: true };
+    }
+    return { ok: false, error: 'Chrome did not report a download after clicking. Check that Gmail is allowed to download multiple files.' };
+  }
+
+  async function openThreadForClick(attachment) {
+    const targetHash = new URL(attachment.threadUrl).hash;
+    if (location.hash !== targetHash) location.hash = targetHash;
+    const open = await gmail.waitFor(() => gmail.isThreadOpen(), 12000, 150);
+    if (!open) return false;
+    await gmail.expandThread();
+    return true;
+  }
+
+  async function runDownloads(previousStatus) {
+    state.running = true;
+    state.stopRequested = false;
+    const heartbeat = startHeartbeat();
+    const listHash = currentListHash();
+    let openedThreadForClick = false;
+    try {
+      setStatus('downloading', { phase: 'download', ownerTabId: state.tabId, statusBeforeDownload: previousStatus, lastError: null });
+      await saveJob();
+      for (;;) {
+        await sleep(40);
+        if (state.stopRequested) break;
+        const batch = await request('PENDING_ATTACHMENTS', { jobId: state.job.id, limit: 50 });
+        if (!batch.length) break;
+        for (const attachment of batch) {
+          if (state.stopRequested) break;
+          state.stage = `Saving ${attachment.fileName}…`;
+          while (await request('COUNT_IN_PROGRESS', { jobId: state.job.id }) >= MAX_CONCURRENT_DOWNLOADS) {
+            if (state.stopRequested) break;
+            await sleep(400);
+          }
+          if (state.stopRequested) break;
+          let result = attachment.url
+            ? await request('START_DIRECT_DOWNLOAD', { attachmentId: attachment.id })
+            : { ok: false, needsClick: true };
+          if (!result.ok && result.needsClick) {
+            if (await openThreadForClick(attachment)) {
+              openedThreadForClick = true;
+              result = await clickDownload(attachment);
+            } else {
+              result = { ok: false, error: 'The conversation could not be reopened to download this file.' };
+            }
+          }
+          if (!result.ok) {
+            await request('PATCH_ATTACHMENT', { id: attachment.id, patch: { state: 'failed', error: result.error, finishedAt: new Date().toISOString() } });
+          }
+          await sleep(Math.max(120, state.config.source.pacingMs));
+        }
+      }
+      if (openedThreadForClick && listHash !== location.hash) location.hash = listHash;
+
+      state.stage = 'Waiting for Chrome to finish the downloads…';
+      let last = -1;
+      let lastChange = Date.now();
+      while (!state.stopRequested) {
+        const inProgress = await request('COUNT_IN_PROGRESS', { jobId: state.job.id });
+        if (!inProgress) break;
+        if (inProgress !== last) {
+          last = inProgress;
+          lastChange = Date.now();
+        }
+        if (Date.now() - lastChange > DOWNLOAD_STALL_MS) {
+          await logEvent('downloads-stalled', { inProgress });
           break;
         }
-        const rows = await waitForListRows(15000);
-        if (!rows?.length) throw new Error('No Gmail rows found. Open Inbox, All Mail, a label, or search results.');
-
-        let nextRow = null;
-        let nextKey = null;
-        for (const row of rows) {
-          const key = getRowKey(row);
-          if (state.config.source.mode === 'selected' && !state.config.source.selectedThreadKeys.includes(key)) continue;
-          if (key && !state.scannedThreadKeys.has(key) && !state.config.source.excludeThreadKeys.includes(key)) {
-            nextRow = row;
-            nextKey = key;
-            break;
-          }
-        }
-
-        if (nextRow && nextKey) {
-          await processRow(nextRow, nextKey);
-          await sleep(Math.min(5000, Math.max(0, Number(state.config.source.pacingMs) || 300)));
-          continue;
-        }
-
-        if (state.config.source.mode === 'current-page' || state.config.source.mode === 'selected') break;
-        const oldSig = pageSignature();
-        const next = getNextButton();
-        if (disabled(next)) break;
-
-        state.status = 'Current page done — opening older emails…';
-        next.click();
-        const changed = await waitRowsChange(oldSig);
-        if (!changed) {
-          await sleep(1200);
-          const currentSig = pageSignature();
-          if (!currentSig || currentSig === oldSig) throw new Error('Gmail did not open the next page of emails.');
-        }
+        await sleep(600);
       }
-      state.status = state.stopRequested ? 'Stopped safely — partial export ready' : (state.status.startsWith('Finished at') ? state.status : 'Finished');
-      if (state.stopRequested) {
-        state.lastStoppedAt = new Date().toISOString();
-        state.job = jobMachine.transition(state.job, 'stopped', { stoppedAt: state.lastStoppedAt });
-      } else {
-        state.job = jobMachine.transition(state.job, 'completed');
-      }
-      await logEvent(state.job.status === 'stopped' ? 'job-stopped' : 'job-completed', { inspected: state.scanned, matched: state.matched, rejected: state.skipped });
-    } catch (e) {
-      console.error('[InboxFoundry]', e);
-      state.status = `Error: ${e.message || String(e)}`;
-      state.job = jobMachine.transition(state.job, 'failed', { lastError: e.message || String(e) });
-      state.job.counters.errors = (state.job.counters.errors || 0) + 1;
-      await logEvent('error', { message: e.message || String(e), stage: state.status });
+      const back = previousStatus === 'ready' ? 'ready' : 'stopped';
+      setStatus(back, { leaseExpiresAt: null });
+      state.stage = state.stopRequested ? 'Stopped. Remaining files stay queued.' : 'Attachments finished.';
+    } catch (error) {
+      if (error instanceof ContextGone) return;
+      console.error('[InboxFoundry]', error);
+      state.stage = error.message;
+      setStatus('failed', { lastError: error.message, leaseExpiresAt: null });
     } finally {
-      if (heartbeat) clearInterval(heartbeat);
+      clearInterval(heartbeat);
       state.running = false;
-      if (state.job) state.job.leaseExpiresAt = null;
-      await runtimeMessage({ type: 'CLEAR_DOWNLOAD_ROUTE' });
-      await save();
-      const shouldExport = state.stopRequested ? state.config.output.autoExportOnStop : state.config.output.autoExportOnComplete;
-      if (shouldExport && (state.job.status === 'stopped' || state.job.status === 'completed')) await downloadExports();
+      if (isAlive()) await saveJob().catch(() => {});
     }
   }
 
-  function exportEnvelope() {
-    const partial = state.job?.status !== 'completed';
-    return {
-      formatVersion: 2,
-      schemaVersion: schema.SCHEMA_VERSION,
-      generator: { name: 'InboxFoundry', version: chrome.runtime.getManifest().version },
-      job: { id: state.job?.id, name: state.job?.name, status: state.job?.status || 'draft', isPartial: partial, createdAt: state.job?.createdAt, startedAt: state.job?.startedAt, stoppedAt: state.job?.stoppedAt, completedAt: state.job?.completedAt },
-      exportedAt: new Date().toISOString(),
-      source: { mode: 'current-view', url: state.job?.sourceUrl || location.href },
-      config: state.config,
-      totals: { inspected: state.scanned, matchedThreads: state.matched, rejected: state.skipped, capturedMessages: state.messages, attachmentDownloadsStarted: state.attachments, attachmentDownloadFailures: state.attachmentFailures },
-      threads: state.exported
-    };
-  }
+  // ---- Messages from the side panel ----
 
-  function triggerDownload(content, type, extension) {
-    const blob = new Blob([content], { type });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `inboxfoundry-${state.job?.id || 'export'}-${new Date().toISOString().replace(/[:.]/g, '-')}.${extension}`;
-    document.documentElement.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 15000);
-  }
-
-  const csvCell = exportEngine.csvCell;
-
-  function messageCsv(threads) {
-    const rows = [['threadKey','subject','messageIndex','from','recipients','date','bodyText','attachmentNames']];
-    for (const thread of threads || []) for (const message of thread.messages || []) rows.push([thread.threadKey || thread.recordId, thread.subject, message.index, message.from, (message.recipients || []).join('; '), message.date, message.bodyTextRaw, (message.attachments || []).map(a => a.fileName).join('; ')]);
-    return rows.map(row => row.map(csvCell).join(',')).join('\r\n');
-  }
-
-  function attachmentManifestCsv(threads) {
-    const rows = [['threadKey','subject','messageIndex','fileName','status','downloadId']];
-    for (const thread of threads || []) for (const item of thread.attachmentResults || []) rows.push([thread.threadKey || thread.recordId, thread.subject, item.messageIndex, item.fileName, item.status, item.downloadId || '']);
-    return rows.map(row => row.map(csvCell).join(',')).join('\r\n');
-  }
-
-  async function sha256(value) {
-    const bytes = new TextEncoder().encode(String(value));
-    const digest = await crypto.subtle.digest('SHA-256', bytes);
-    return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
-  }
-
-  async function preparedEnvelope() {
-    const payload = exportEnvelope();
-    if (state.job) {
-      const refreshed = await runtimeMessage({ type: 'REFRESH_DOWNLOAD_STATES', jobId: state.job.id });
-      if (!refreshed?.ok) throw new Error(refreshed?.error || 'Could not refresh Chrome download states.');
-    }
-    const persistedDownloads = state.job ? await runtimeMessage({ type: 'DB_GET_DOWNLOADS', jobId: state.job.id }) : null;
-    payload.downloads = persistedDownloads?.result || [];
-    payload.totals.attachmentDownloadsComplete = payload.downloads.filter(row => row.state === 'complete').length;
-    payload.totals.attachmentDownloadsInterrupted = payload.downloads.filter(row => row.state === 'interrupted').length;
-    payload.attachmentAnalysis = attachmentAnalysis.analyze(payload.threads.flatMap(thread => (thread.attachmentSelection || []).map(item => ({ ...item, threadKey:thread.threadKey || thread.recordId }))));
-    payload.integrity = { algorithm: 'SHA-256', scope: 'captured thread records', generatedAt: new Date().toISOString(), threads: [] };
-    for (const thread of payload.threads) payload.integrity.threads.push({ threadKey: thread.threadKey || thread.recordId, sha256: await sha256(JSON.stringify(thread)) });
-    payload.integrity.exportSha256 = await sha256(JSON.stringify(payload.threads));
-    return payload;
-  }
-
-  async function downloadExports(requestedFormats) {
-    const payload = await preparedEnvelope();
-    const formats = requestedFormats?.length ? requestedFormats : state.config.output.formats;
-    if (formats.includes('json')) {
-      const split = Number(state.config.output.splitRecords);
-      if (Number.isFinite(split) && split > 0 && payload.threads.length > split) {
-        for (const part of exportEngine.splitEnvelope(payload, split)) {
-          part.integrity.exportSha256 = await sha256(JSON.stringify(part.threads));
-          triggerDownload(JSON.stringify(part, null, state.config.output.prettyJson ? 2 : 0), 'application/json', `part-${String(part.part.index).padStart(3, '0')}.json`);
-        }
-      } else {
-        triggerDownload(JSON.stringify(payload, null, state.config.output.prettyJson ? 2 : 0), 'application/json', 'json');
+  const handlers = {
+    PING: () => ({ alive: true }),
+    GET_STATUS: () => ({
+      running: state.running,
+      stage: state.stage,
+      jobId: state.job?.id || null,
+      jobStatus: state.job?.status || 'idle',
+      counters: state.job?.counters || null,
+      hidden: document.hidden,
+      page: state.page
+    }),
+    VIEW_INFO: () => {
+      const range = gmail.paginationRange();
+      return { threadOpen: gmail.isThreadOpen(), rows: gmail.listRows(1).length, total: range?.total ?? null, base: currentBase() };
+    },
+    CHECK_COMPAT: () => ({ report: gmail.compatibilityReport() }),
+    OPEN_QUERY: message => {
+      gmail.search(message.query);
+      return {};
+    },
+    START_SCAN: async message => {
+      const jobId = await startScan(message.config);
+      runScan();
+      return { jobId };
+    },
+    RESUME_SCAN: async message => {
+      await prepareResume(message.jobId, message.overrides);
+      runScan();
+      return { jobId: state.job.id };
+    },
+    START_DOWNLOADS: async message => {
+      if (state.running) throw new Error('A job is already running in this Gmail tab.');
+      await ensureTabId();
+      await loadJob(message.jobId);
+      await assertNoOtherLiveJob(message.jobId);
+      if (state.job.accountSlot !== accountSlot()) throw new Error('This batch belongs to another Gmail account. Switch to that account first.');
+      let previous = state.job.status;
+      if (jobMachine.isActive(state.job)) {
+        previous = 'interrupted';
+        state.job = { ...state.job, status: 'interrupted' };
       }
-    }
-    if (formats.includes('ndjson')) triggerDownload(state.exported.map(thread => JSON.stringify(thread)).join('\n'), 'application/x-ndjson', 'ndjson');
-    if (formats.includes('csv')) triggerDownload(messageCsv(payload.threads), 'text/csv', 'csv');
-    if (formats.includes('text')) triggerDownload(state.exported.map(thread => `# ${thread.subject}\n\n${thread.messages.map(message => `From: ${message.from}\nDate: ${message.date}\n\n${message.bodyTextRaw}`).join('\n\n---\n\n')}`).join('\n\n========\n\n'), 'text/plain', 'txt');
-    if (formats.includes('markdown')) triggerDownload(state.exported.map(thread => `# ${thread.subject || '(No subject)'}\n\n${thread.messages.map(message => `**From:** ${message.from || ''}  \n**Date:** ${message.date || ''}\n\n${String(message.bodyTextRaw || '').split('\n').map(line => `    ${line}`).join('\n')}`).join('\n\n---\n\n')}`).join('\n\n***\n\n'), 'text/markdown', 'md');
-    if (formats.includes('html')) triggerDownload(exportEngine.printableHtml(payload), 'text/html', 'html');
-    if (formats.includes('pdf')) triggerDownload(exportEngine.basicPdf(payload), 'application/pdf', 'pdf');
-    if (formats.includes('manifest')) triggerDownload(attachmentManifestCsv(payload.threads), 'text/csv', 'attachments.csv');
-    if (formats.includes('pdfzip')) {
-      const pdfEntries = exportEngine.individualPdfEntries(payload);
-      const indexRows = [['ordinal','threadKey','subject','messageCount','pdfFile']];
-      pdfEntries.forEach((entry, index) => indexRows.push([index + 1, entry.threadKey, entry.subject, entry.messageCount, entry.name]));
-      const entries = pdfEntries.map(({ name, data }) => ({ name:`pdf/${name}`, data }));
-      entries.push({ name:'index.csv', data:indexRows.map(row => row.map(csvCell).join(',')).join('\r\n') });
-      entries.push({ name:'README.txt', data:`InboxFoundry individual PDF package\n\nBatch: ${payload.job?.name || ''}\nPDF count: ${pdfEntries.length}\nPartial: ${payload.job?.isPartial ? 'yes' : 'no'}\n\nThese are text-oriented convenience PDFs derived from captured Gmail content. Consult archive.json/evidence exports for canonical structured records and integrity metadata.\n` });
-      const checksums = [];
-      for (const entry of entries) checksums.push(`${await sha256(entry.data)}  ${entry.name}`);
-      entries.push({ name:'CHECKSUMS.sha256', data:`${checksums.join('\n')}\n` });
-      triggerDownload(exportEngine.zipArchive(entries), 'application/zip', 'individual-pdfs.zip');
-    }
-    if (formats.includes('emlzip')) {
-      const emlEntries = exportEngine.emlEntries(payload);
-      const indexRows = [['ordinal','threadKey','subject','messageIndex','emlFile']];
-      emlEntries.forEach((entry, index) => indexRows.push([index + 1, entry.threadKey, entry.subject, entry.messageIndex, entry.name]));
-      const entries = emlEntries.map(({ name, data }) => ({ name:`eml/${name}`, data }));
-      entries.push({ name:'index.csv', data:indexRows.map(row => row.map(csvCell).join(',')).join('\r\n') });
-      entries.push({ name:'README.txt', data:`InboxFoundry reconstructed EML package\n\nBatch: ${payload.job?.name || ''}\nMessage count: ${emlEntries.length}\nPartial: ${payload.job?.isPartial ? 'yes' : 'no'}\n\nThese EML files are portable reconstructions from fields captured through the Gmail interface. They are not Google's original raw RFC 5322 source, omit unavailable transport headers, and do not embed separately downloaded attachment binaries. The canonical InboxFoundry JSON remains the highest-fidelity record produced by DOM mode.\n` });
-      const checksums = [];
-      for (const entry of entries) checksums.push(`${await sha256(entry.data)}  ${entry.name}`);
-      entries.push({ name:'CHECKSUMS.sha256', data:`${checksums.join('\n')}\n` });
-      triggerDownload(exportEngine.zipArchive(entries), 'application/zip', 'reconstructed-eml.zip');
-    }
-    if (formats.includes('mbox')) triggerDownload(exportEngine.reconstructedMbox(payload), 'application/mbox', 'reconstructed.mbox');
-    if (formats.includes('zip')) {
-      const entries = [
-        { name:'archive.json', data:JSON.stringify(payload, null, 2) },
-        { name:'records.ndjson', data:payload.threads.map(thread => JSON.stringify(thread)).join('\n') },
-        { name:'records.csv', data:messageCsv(payload.threads) },
-        { name:'attachments.csv', data:attachmentManifestCsv(payload.threads) },
-        { name:'attachment-analysis.json', data:JSON.stringify(payload.attachmentAnalysis, null, 2) },
-        { name:'index.html', data:exportEngine.printableHtml(payload) },
-        { name:'README.txt', data:`InboxFoundry evidence package\n\nBatch: ${payload.job?.name || ''}\nExported: ${payload.exportedAt}\nPartial: ${payload.job?.isPartial ? 'yes' : 'no'}\n\nThis ZIP contains message records and manifests. Attachment binaries remain in the separately recorded Downloads folders and are not embedded because the extension does not request broad filesystem-read permission. Verify package files with CHECKSUMS.sha256.\n` }
-      ];
-      const checksums = [];
-      for (const entry of entries) checksums.push(`${await sha256(entry.data)}  ${entry.name}`);
-      entries.push({ name:'CHECKSUMS.sha256', data:`${checksums.join('\n')}\n` });
-      triggerDownload(exportEngine.zipArchive(entries), 'application/zip', 'zip');
-    }
-  }
-
-  async function downloadJSON() {
-    return downloadExports(['json']);
-  }
-
-  async function downloadEncrypted(passphrase) {
-    const payload = await preparedEnvelope();
-    const encrypted = await exportEngine.encryptText(JSON.stringify(payload), passphrase);
-    triggerDownload(encrypted, 'application/vnd.inboxfoundry.encrypted+json', 'ifenc');
-  }
-
-  async function downloadDiagnostics() {
-    const events = state.job ? await runtimeMessage({ type: 'DB_GET_EVENTS', jobId: state.job.id }) : null;
-    const downloads = state.job ? await runtimeMessage({ type: 'DB_GET_DOWNLOADS', jobId: state.job.id }) : null;
-    const report = {
-      generatedAt: new Date().toISOString(), extensionVersion: chrome.runtime.getManifest().version,
-      browser: navigator.userAgent.replace(/\([^)]*\)/g, '(redacted platform)'),
-      job: state.job ? { id: state.job.id, status: state.job.status, createdAt: state.job.createdAt, updatedAt: state.job.updatedAt, counters: state.job.counters } : null,
-      configShape: state.config ? { emailRuleCounts: Object.fromEntries(Object.entries(state.config.email).filter(([,value]) => Array.isArray(value)).map(([key,value]) => [key,value.length])), attachmentAction: state.config.attachments.action, typeGroupCount: state.config.attachments.typeGroups.length, outputFormats: state.config.output.formats } : null,
-      events: events?.result || [],
-      downloads: (downloads?.result || []).map((row, index) => ({ ordinal: index + 1, state: row.state, method: row.method, error: row.error || null, startedAt: row.startedAt, finishedAt: row.finishedAt }))
-    };
-    triggerDownload(JSON.stringify(report, null, 2), 'application/json', 'diagnostics.json');
-  }
-
-  const initialLoad = load();
-
-  async function waitUntilStopped(timeoutMs = 45000) {
-    const startedAt = Date.now();
-    while (state.running && Date.now() - startedAt < timeoutMs) await sleep(100);
-    return !state.running;
-  }
-
-  function clearState() {
-    state.exported = [];
-    state.scannedThreadKeys = new Set();
-    state.scanned = 0;
-    state.matched = 0;
-    state.skipped = 0;
-    state.messages = 0;
-    state.attachments = 0;
-    state.attachmentFailures = 0;
-    state.status = 'Reset';
-    state.lastStoppedAt = null;
-  }
-
-  async function createFreshJob(config) {
-    const listed = await runtimeMessage({ type: 'DB_LIST_JOBS' });
-    const jobs = listed?.result || [];
-    const now = Date.now();
-    const liveJob = jobs.find(job => ['running','pausing'].includes(job.status) && (Date.parse(job.leaseExpiresAt || 0) > now || now - Date.parse(job.updatedAt || job.startedAt || 0) < 120000));
-    if (liveJob) throw new Error(`Another export (${liveJob.name}) is active. Stop it before starting a new job.`);
-    for (const stale of jobs.filter(job => ['running','pausing'].includes(job.status))) {
-      await runtimeMessage({ type: 'DB_PATCH_JOB', jobId: stale.id, patch: { status: 'interrupted', lastError: 'The Gmail tab closed or stopped responding.' } });
-    }
-    clearState();
-    state.config = schema.normalizeConfig(config);
-    if (state.config.source.mode === 'selected') {
-      state.config.source.selectedThreadKeys = getRows().filter(isRowSelected).map(getRowKey).filter(Boolean);
-      if (!state.config.source.selectedThreadKeys.length) throw new Error('Select at least one Gmail row before starting a selected-rows export.');
-    }
-    if (state.config.source.incremental) {
-      const previous = jobs.filter(job => job.status === 'completed' && job.sourceUrl === location.href)
-        .sort((a, b) => String(b.completedAt || b.updatedAt).localeCompare(String(a.completedAt || a.updatedAt)))[0];
-      if (previous) {
-        const rows = await runtimeMessage({ type: 'DB_GET_THREADS', jobId: previous.id });
-        state.config.source.excludeThreadKeys = (rows?.result || []).filter(row => row.outcome === 'matched').map(row => row.threadKey);
-        state.config.source.incrementalBaseJobId = previous.id;
+      runDownloads(previous);
+      return { jobId: state.job.id };
+    },
+    STOP: async () => {
+      state.stopRequested = true;
+      state.stage = 'Stopping after the current item…';
+      if (state.running && state.job?.status === 'running') {
+        setStatus('pausing');
+        await saveJob();
       }
+      return {};
+    },
+    PREVIEW_THREAD: async message => {
+      if (!gmail.isThreadOpen()) throw new Error('Open a conversation in Gmail to preview it. Nothing is saved or downloaded.');
+      await gmail.expandThread();
+      const view = gmail.extractThread();
+      if (!view.messages.length) throw new Error('No message body is visible in this conversation.');
+      const evaluation = filterEngine.evaluateThread(view, view.messages, schema.normalizeConfig(message.config));
+      return {
+        matched: evaluation.matched,
+        subject: view.subject,
+        reasons: evaluation.reasons,
+        messageCount: view.messages.length,
+        attachments: evaluation.attachmentEvaluations.map(item => ({ fileName: item.attachment.fileName, matched: item.matched, reasons: item.reasons }))
+      };
     }
-    state.options.downloadAttachments = ['all', 'matching'].includes(state.config.attachments.action);
-    const batchNumber = jobs.reduce((max, job) => Math.max(max, Number(job.batchNumber) || 0), 0) + 1;
-    state.job = schema.createJob(state.config, { name: `Batch ${String(batchNumber).padStart(3, '0')} · ${new Date().toLocaleDateString()}`, sourceUrl: location.href, accountSlot: accountSlot() });
-    state.job.batchNumber = batchNumber;
-    state.job.ownerTabId = state.tabId;
-    const old = jobs.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt))).slice(schema.FREE_LIMITS.retainedJobs - 1);
-    for (const job of old) await runtimeMessage({ type: 'DB_DELETE_JOB', jobId: job.id });
-    await save();
-  }
+  };
 
-  async function previewCurrentThread(config) {
-    if (!visibleThreadView()) throw new Error('Open a Gmail conversation to preview it. Preview never saves or downloads anything.');
-    await expandCollapsedMessages();
-    await expandTrimmedContent();
-    const messages = extractMessages();
-    if (!messages.length) throw new Error('No message body is available in the open conversation.');
-    const meta = extractThreadMeta('preview');
-    const evaluation = filterEngine.evaluateThread(meta, messages, schema.normalizeConfig(config));
-    return {
-      matched: evaluation.matched, subject: meta.subject, reasons: evaluation.reasons,
-      messageCount: messages.length, matchingMessageCount: evaluation.matchedMessageIndexes.length,
-      attachmentCount: messages.reduce((total, message) => total + (message.attachments?.length || 0), 0),
-      matchingAttachmentCount: evaluation.matchedAttachments.length,
-      attachments: evaluation.attachmentEvaluations.map(item => ({
-        fileName:item.attachment.fileName || item.attachment.name,
-        messageIndex:item.attachment.messageIndex,
-        sizeBytes:item.attachment.sizeBytes ?? null,
-        matched:item.matched,
-        reasons:item.reasons,
-        classification:item.classification
-      }))
-    };
-  }
-
-  async function dryRunSample(config, requestedLimit = 3) {
-    if (state.running) throw new Error('Stop the active export before running a sample.');
-    if (visibleThreadView()) throw new Error('Return to a Gmail list or search before running a sample.');
-    const sampleConfig = schema.normalizeConfig(config);
-    const limit = Math.min(10, Math.max(1, Number(requestedLimit) || 3));
-    const originalStatus = state.status;
-    const initialRows = await waitForListRows(15000);
-    const keys = (initialRows || []).map(getRowKey).filter(Boolean).slice(0, limit);
-    if (!keys.length) throw new Error('No Gmail rows found for the sample.');
-    const listUrl = location.href;
-    const listHash = location.hash;
-    const results = [];
-
-    try {
-      for (let index = 0; index < keys.length; index++) {
-        const rowKey = keys[index];
-        state.status = `Dry run ${index + 1}/${keys.length}…`;
-        const row = getRows().find(candidate => getRowKey(candidate) === rowKey);
-        if (!row) {
-          results.push({ ordinal:index + 1, matched:false, error:'The Gmail row was no longer visible.' });
-          continue;
-        }
-        if (!await openRow(row)) {
-          results.push({ ordinal:index + 1, matched:false, error:'Could not open this Gmail thread.' });
-          continue;
-        }
-        await sleep(350);
-        try {
-          await expandCollapsedMessages();
-          await expandTrimmedContent();
-          const meta = extractThreadMeta(rowKey);
-          const messages = extractMessages();
-          if (!messages.length) throw new Error('No message body could be captured.');
-          const evaluation = filterEngine.evaluateThread(meta, messages, sampleConfig);
-          results.push({
-            ordinal:index + 1,
-            subject:meta.subject,
-            matched:evaluation.matched,
-            reasons:evaluation.reasons,
-            messageCount:messages.length,
-            matchingMessageCount:evaluation.matchedMessageIndexes.length,
-            attachmentCount:messages.reduce((total, message) => total + (message.attachments?.length || 0), 0),
-            matchingAttachmentCount:evaluation.matchedAttachments.length
-          });
-        } catch (error) {
-          results.push({ ordinal:index + 1, matched:false, error:error?.message || String(error) });
-        }
-        await goBackToList(listUrl, listHash);
-      }
-    } finally {
-      state.status = originalStatus;
-      if (visibleThreadView()) {
-        try { await goBackToList(listUrl, listHash); } catch (_) {}
-      }
-    }
-
-    return {
-      requested:limit,
-      inspected:results.length,
-      matched:results.filter(result => result.matched).length,
-      rejected:results.filter(result => !result.matched && !result.error).length,
-      errors:results.filter(result => result.error).length,
-      results
-    };
-  }
-
-  async function loadRetainedJob(jobId) {
-    if (state.running) throw new Error('Stop the active export before opening another batch.');
-    const found = await runtimeMessage({ type: 'DB_GET_JOB', jobId });
-    if (!found?.result) throw new Error('That retained batch no longer exists.');
-    const rows = await runtimeMessage({ type: 'DB_GET_THREADS', jobId });
-    const records = rows?.result || [];
-    state.job = found.result;
-    if (['running','pausing'].includes(state.job.status) && Date.parse(state.job.leaseExpiresAt || 0) <= Date.now()) {
-      state.job = jobMachine.transition(state.job, 'interrupted', { lastError: 'The previous Gmail tab stopped before releasing its job lease.' });
-      await runtimeMessage({ type: 'DB_PUT_JOB', job: state.job });
-    }
-    state.config = schema.normalizeConfig(state.job.config);
-    state.exported = records.filter(row => row.outcome === 'matched').map(row => row.record).filter(Boolean);
-    state.scannedThreadKeys = new Set(records.filter(row => ['matched', 'rejected'].includes(row.outcome)).map(row => row.threadKey));
-    state.scanned = state.scannedThreadKeys.size;
-    state.matched = state.exported.length;
-    state.skipped = records.filter(row => row.outcome === 'rejected').length;
-    state.messages = state.exported.reduce((total, thread) => total + (thread.messages?.length || 0), 0);
-    const downloads = await runtimeMessage({ type: 'DB_GET_DOWNLOADS', jobId });
-    const downloadRows = downloads?.result || [];
-    state.attachments = downloadRows.filter(row => ['in_progress','complete','interrupted'].includes(row.state)).length;
-    state.attachmentFailures = downloadRows.filter(row => ['failed','interrupted'].includes(row.state)).length;
-    state.status = `Loaded ${state.job.name}`;
-    const key = state.tabId ? `${ACTIVE_JOB_KEY}:${state.tabId}` : ACTIVE_JOB_KEY;
-    await chrome.storage.local.set({ [key]: state.job.id });
-  }
-
-  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    (async () => {
-      try {
-        await initialLoad;
-
-        if (msg.type === 'START_EXPORT') {
-          if (state.running) {
-            sendResponse({ ok: false, error: 'An export is already running in this Gmail tab.' });
-            return;
-          }
-          const disclosure = await chrome.storage.local.get('inboxFoundryPrivacyAcknowledgedV1');
-          if (disclosure.inboxFoundryPrivacyAcknowledgedV1 !== true) throw new Error('Open the InboxFoundry workspace and acknowledge the local data disclosure before your first export.');
-          const suppliedConfig = msg.config || schema.normalizeConfig({
-            attachments: { action: msg.options?.downloadAttachments === false ? 'metadata' : 'all' }
-          });
-          await createFreshJob(suppliedConfig);
-          run();
-          sendResponse({ ok: true });
-        } else if (msg.type === 'RESUME_EXPORT') {
-          if (state.running) throw new Error('This export is already running.');
-          if (!state.job || !['stopped', 'interrupted', 'failed'].includes(state.job.status)) throw new Error('There is no stopped or interrupted export to resume.');
-          if (state.job.sourceUrl && location.href !== state.job.sourceUrl) throw new Error('Return to the Gmail list/search where this batch started before resuming it.');
-          const jobs = await runtimeMessage({ type: 'DB_LIST_JOBS' });
-          const otherLive = (jobs?.result || []).find(job => job.id !== state.job.id && ['running','pausing'].includes(job.status) && Date.parse(job.leaseExpiresAt || job.updatedAt || 0) > Date.now());
-          if (otherLive) throw new Error(`Another export (${otherLive.name}) is active.`);
-          state.job.ownerTabId = state.tabId;
-          run();
-          sendResponse({ ok: true });
-        } else if (msg.type === 'STOP_EXPORT') {
-          state.stopRequested = true;
-          state.status = state.running ? 'Stopping after the current item…' : 'Stopped';
-          if (state.running && state.job?.status === 'running') state.job = jobMachine.transition(state.job, 'pausing');
-          if (state.job) await save();
-          if (state.job) await logEvent('stop-requested', { afterCurrentThread: true });
-          sendResponse({ ok: true });
-        } else if (msg.type === 'DOWNLOAD_JSON') {
-          await downloadJSON();
-          sendResponse({ ok: true });
-        } else if (msg.type === 'DOWNLOAD_EXPORTS') {
-          await downloadExports(msg.formats);
-          sendResponse({ ok: true });
-        } else if (msg.type === 'DOWNLOAD_DIAGNOSTICS') {
-          await downloadDiagnostics();
-          sendResponse({ ok: true });
-        } else if (msg.type === 'DOWNLOAD_ENCRYPTED') {
-          await downloadEncrypted(msg.passphrase);
-          sendResponse({ ok: true });
-        } else if (msg.type === 'GET_EXPORT_ESTIMATE') {
-          const bytes = new Blob([JSON.stringify(exportEnvelope())]).size;
-          sendResponse({ ok: true, bytes, threads: state.exported.length, messages: state.messages, attachments: state.attachments });
-        } else if (msg.type === 'PREVIEW_CURRENT_THREAD') {
-          sendResponse({ ok: true, ...(await previewCurrentThread(msg.config)) });
-        } else if (msg.type === 'DRY_RUN_SAMPLE') {
-          sendResponse({ ok: true, ...(await dryRunSample(msg.config, msg.limit)) });
-        } else if (msg.type === 'OPEN_GMAIL_QUERY') {
-          const query = String(msg.query || '').trim();
-          gmail.searchMessages(query);
-          sendResponse({ ok: true });
-        } else if (msg.type === 'LOAD_JOB') {
-          await loadRetainedJob(msg.jobId);
-          sendResponse({ ok: true });
-        } else if (msg.type === 'RESET_EXPORT') {
-          state.stopRequested = true;
-          if (!await waitUntilStopped()) {
-            sendResponse({ ok: false, error: 'The active export did not stop in time. Try again after its status changes to Stopped.' });
-            return;
-          }
-          const oldJobId = state.job?.id;
-          clearState();
-          state.job = null;
-          state.config = schema.normalizeConfig();
-          const tabJobKey = state.tabId ? `${ACTIVE_JOB_KEY}:${state.tabId}` : ACTIVE_JOB_KEY;
-          await chrome.storage.local.remove([STORE_KEY, LEGACY_STORE_KEY, tabJobKey]);
-          if (oldJobId) await runtimeMessage({ type: 'DB_DELETE_JOB', jobId: oldJobId });
-          sendResponse({ ok: true });
-        } else if (msg.type === 'CLEAR_MEMORY_STATE') {
-          if (state.running) throw new Error('Stop this export before clearing its local state.');
-          clearState(); state.job = null; state.config = schema.normalizeConfig();
-          sendResponse({ ok: true });
-        } else if (msg.type === 'GET_STATUS') {
-          const downloads = state.job ? await runtimeMessage({ type: 'DB_GET_DOWNLOADS', jobId: state.job.id }) : null;
-          const downloadRows = downloads?.result || [];
-          const elapsedSeconds = state.job?.startedAt ? Math.max(0, (Date.now() - Date.parse(state.job.startedAt)) / 1000) : 0;
-          sendResponse({
-            ok: true,
-            running: state.running,
-            status: state.status,
-            scanned: state.scanned,
-            matched: state.matched,
-            skipped: state.skipped,
-            messages: state.messages,
-            attachments: state.attachments,
-            attachmentFailures: state.attachmentFailures,
-            downloadsComplete: downloadRows.filter(row => row.state === 'complete').length,
-            downloadsInterrupted: downloadRows.filter(row => row.state === 'interrupted').length,
-            downloadsQueued: downloadRows.filter(row => row.state === 'queued').length,
-            downloadsFailed: downloadRows.filter(row => row.state === 'failed').length,
-            elapsedSeconds,
-            ratePerMinute: elapsedSeconds ? state.scanned / elapsedSeconds * 60 : 0,
-            downloadAttachments: state.options.downloadAttachments,
-            config: state.config,
-            jobId: state.job?.id || null,
-            jobStatus: state.job?.status || 'idle',
-            justStopped: !!state.lastStoppedAt
-          });
-        }
-      } catch (error) {
-        console.error('[InboxFoundry] Message handling failed', error);
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    const handler = handlers[message?.type];
+    if (!handler) return false;
+    Promise.resolve()
+      .then(() => handler(message))
+      .then(result => sendResponse({ ok: true, ...result }))
+      .catch(error => {
+        console.error('[InboxFoundry]', error);
         sendResponse({ ok: false, error: error?.message || String(error) });
-      }
-    })();
+      });
     return true;
   });
 })();

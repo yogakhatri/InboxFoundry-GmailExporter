@@ -1,63 +1,46 @@
-# Release testing
+# Testing
 
-Use synthetic accounts and messages only. Never attach real customer, employee, financial, medical, or legal email to a public issue.
+Use synthetic messages only. Never attach real email to an issue.
 
-## Automated gate
-
-Run:
+## Automated
 
 ```bash
-npm test
+npm test          # unit tests and static validation
+npm run lint      # unused code and undefined names
+npm run test:e2e  # real extension, real browser, Gmail-shaped page
 ```
 
-This checks JavaScript syntax, rule/state/export/path/download-policy unit tests, mocked background-worker durability and selective-retry behavior, manifest permissions, CSP, manifest/imported resources, extension-page script/style references, DOM IDs referenced by UI code, sanitized-diagnostics invariants, and local README links.
+`npm run test:e2e [name-filter]` loads the extension into a temporary profile and maps `mail.google.com` to a loopback page, so real Gmail is never contacted. It clicks the real side-panel buttons and checks the real files on disk. It needs OpenSSL and a Chromium-family browser. Set `INBOXFOUNDRY_CHROME` if auto-detection fails. Branded Chrome 137+ can't be used because it no longer accepts `--load-extension`. One small shim points the panel's "active tab" lookup at the Gmail tab, because the test opens the panel as a separate page.
 
-Run the isolated browser lifecycle gate:
+## What the automated tests can't prove
 
-```bash
-npm run test:browser
-```
+`tests/e2e/fixture.mjs` is written from knowledge of Gmail's markup. **It is not Gmail.** Passing means the logic is sound against that shape, not that every selector matches the live page today. These need the checklist below:
 
-This launches an unpacked extension in a fresh temporary browser profile against a loopback-only HTTPS Gmail fixture. It does not open a real Gmail account. The test proves content-script injection, a non-persisting two-thread dry run, keyword filtering, a durable checkpoint, safe Stop, immediate partial-export availability, resume, exact matched/rejected records in IndexedDB, initialized side-panel scripts and retained-batch loading, service-worker termination/restart, tab reload, and durable counter restoration. It also runs the actual bundled Tesseract.js/PDF.js stack in the extension side panel against a generated high-contrast PNG and an image-only scanned PDF and verifies recognized fixture tokens. The Gmail fixture uses three synthetic threads and expects `3 scanned / 2 matched / 1 rejected`.
+- Selectors: row IDs, message blocks, attachment cards, pagination range.
+- Whether the Older button and rows respond to synthetic mouse events.
+- Collapsed-message and trimmed-content controls.
+- Chrome's real one-a-minute timer throttling. `INBOXFOUNDRY_SLOW=1 npm run test:e2e -- "six minutes"` keeps a tab hidden for over seven minutes, but the page's timers weren't throttled in headless Chromium, so that behaviour needs a normal window.
+- Popup blocking, the "Ask where to save" setting, and dangerous-file prompts.
 
-The browser test requires OpenSSL and a Chromium-family executable that permits unpacked extensions in headless mode. Set `INBOXFOUNDRY_OPENSSL` or `INBOXFOUNDRY_CHROME` when auto-detection is not suitable. Some branded Chrome builds reject `--load-extension` in headless mode; Chromium or Brave can run this development-only gate. To run both automated layers:
+## Manual checklist on live Gmail
 
-```bash
-npm run test:release
-```
+Use a dedicated account with synthetic mail. Record browser version, Gmail language, date, and pass or fail. Don't write "all passed" for cases you didn't run.
 
-## Manual real-Gmail synthetic matrix
+**Start here.** Run **Check Gmail compatibility** on a list and on an open conversation with attachments. Expect `rowsWithGmailId` to equal `rowsVisible`, `olderControl` to be `label` or `position`, `messagesNotExpanded` to be 0, `datesUnknown` to be 0, and attachments to have direct URLs.
 
-The browser gate validates lifecycle behavior against deterministic Gmail-shaped DOM fixtures. For every release candidate, also use a dedicated test mailbox with synthetic messages and record Chrome version, Gmail language, date, tester, and pass/fail evidence.
+- [ ] Search by sender, date, and file type; the Gmail search shown is the one that runs.
+- [ ] More than one page of results: every conversation captured, once, with no freeze.
+- [ ] Rows in the panel match what's in Gmail, with the same subject and dates.
+- [ ] Long conversation with collapsed messages and trimmed content: all messages captured.
+- [ ] Newsletter with "Download" links and an app-store badge: nothing opens, nothing listed as a file.
+- [ ] Attachments: PDF, same name twice, Drive link, large file. The right files land in the right folders, and sizes look right.
+- [ ] Inbox, All Mail, a label, a search, Spam, Trash; reading pane on and off; conversation view off.
+- [ ] Gmail in a non-English language: pagination, dates, and sizes.
+- [ ] Tab hidden for over five minutes while scanning.
+- [ ] Stop, Resume, reload Gmail mid-scan, close the tab mid-scan, restart the browser.
+- [ ] Repeat export skips saved mail and picks up a new reply.
+- [ ] Open EML/MBOX in a mail program; print the HTML to PDF with non-English text.
 
-- One-message thread with no attachment.
-- Multi-message thread with collapsed messages and trimmed quoted content.
-- Empty/draft-like message body.
-- Current thread, current page, selected rows, and all-pages scope.
-- Inbox, Sent, label, search, Spam, Trash, and `in:anywhere` candidates.
-- ANY and ALL rules, exclusions, whole-word, wildcard, valid/invalid regex.
-- One-message ALL versus cross-message matching.
-- Sender, recipient, domain, subject, date, message-count, attachment-presence rules.
-- Whole-thread versus matching-message output.
-- PDF, spreadsheet, unknown extension, uppercase extension, duplicate filename, inline image, logo, tiny image, and unknown-size file.
-- Metadata-only, matching-download, all-download, and no-file actions.
-- Chrome multiple-download prompt, completed file, interrupted file, erased file, and blocked/dangerous file.
-- Attachment review shows matching/exclusion reasons; selected filenames populate rules; selective retry resumes only checked interrupted tasks.
-- Local inspector hashes synthetic identical/different files correctly, searches text/PDF/DOCX/XLSX/PPTX, decodes embedded ToUnicode maps plus bounded Flate/ASCIIHex/ASCII85/RunLength filter chains, honors file/text/PDF-stream/CMap/object/ZIP-expansion limits, rejects encrypted PDFs, unsupported filters, malformed encodings, prototype-like font aliases, corrupt CRC, and unsafe packages, clears memory, and exports no extracted text/snippets.
-- Opt-in OCR recognizes synthetic English PNG/JPEG and scanned-PDF fixtures, bypasses searchable PDFs, rejects unsupported/SVG/encrypted input, enforces image/PDF/page/session/pixel/dimension/text limits before expensive work, processes pages sequentially, terminates on cancellation, works with all runtime paths under `chrome-extension://`, and never places recognized text or page segments in a default report.
-- PII detection validates Luhn/IBAN checksums, avoids common date/number false positives, redacts selected pattern types, keeps raw findings out of default reports, and includes structured suggestions only after explicit approval.
-- Incremental SHA-256 matches standard vectors and Node's implementation across arbitrary chunk boundaries, never whole-reads unsupported large binaries, reports progress, enforces the 2 GB limit, and cancels cleanly.
-- Simulated background routing failure does not click Gmail's download control or create duplicate downloads.
-- Stop while opening, extracting, downloading, returning to list, and paginating.
-- Resume after Stop, tab reload, browser restart, and expired job lease.
-- Attempt concurrent start from two Gmail tabs.
-- Unexpected manual navigation, offline/reconnect, signed-out session, and Gmail timeout.
-- JSON, split JSON, NDJSON, CSV, TXT, Markdown, HTML search, merged basic PDF, individual-PDF ZIP/index/checksums, manifest, evidence ZIP/checksums, encrypted archive, and wrong-passphrase rejection.
-- Unicode subject/sender/body/name, reserved device filename, traversal-like filename, very long name, and duplicate name.
-- Incremental job skips only previously matched thread keys from the same exact scope.
-- Delete current job, all jobs, all presets, and verify downloaded files remain.
-- Diagnostics contain no subject, body, address, filename, Gmail URL, thread/message ID, or filter term.
+## Before publishing
 
-## Release blockers
-
-Do not publish when any completed thread can be silently lost or duplicated, diagnostics expose mailbox content, a permission lacks a shipped purpose, Stop corrupts a job, resume is not idempotent, raw email HTML executes in an extension page, or Gmail selector compatibility has not been confirmed.
+Don't publish if any conversation can be silently lost or duplicated, Stop corrupts a job, diagnostics expose mail content, a permission has no shipped purpose, captured HTML can execute in an extension page, or the live-Gmail checklist hasn't been run.

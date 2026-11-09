@@ -2,32 +2,48 @@
 
 Thanks for helping improve InboxFoundry.
 
-## Before opening an issue
+## The rule that matters most
 
-- Test the latest version from the default branch.
-- Reproduce the problem with a narrow Gmail search and synthetic or non-sensitive email.
-- Check whether Gmail's interface language is English.
-- Never attach a real export, email body, message ID, authentication token, or personal Gmail URL to a public issue.
+Never attach real email, exports, addresses, Gmail URLs, IDs, or tokens to anything public. Use synthetic data and the compatibility check, which contains counts only.
 
-A useful bug report includes the extension version, Chrome version, operating system, Gmail language, exact action, expected result, actual result, and sanitized console error. Explain whether conversation view is enabled and whether attachments were selected.
+## Most useful contribution: Gmail compatibility
 
-## Development setup
+Gmail changes its page without notice. If something stops working:
 
-1. Fork and clone the repository.
-2. Run `npm test` with a current Node.js release.
-3. Load the repository folder from `chrome://extensions` using **Load unpacked**.
-4. After each source change, select **Reload** on the extension card and reload the Gmail test tab.
+1. Run **Check Gmail compatibility** on a list and on an open conversation.
+2. Open a "Gmail page changed" issue with the output, your browser version, and Gmail's language.
+3. To fix it, update the table at the top of `lib/gmail-adapter.js`, the only place Gmail selectors live, and add the new shape to `tests/e2e/fixture.mjs`.
 
-There is no compile or bundle step. Keep the extension dependency-free unless a dependency has a clear, reviewed benefit. OCR/PDF runtime files are deliberately vendored so extension pages never load executable code or recognition models from a network. When updating one, record its exact package version, license, npm integrity, and SHA-256 runtime hashes in `vendor/ASSET_MANIFEST.json`; update `vendor/THIRD_PARTY_NOTICES.md`; run the unit, validation, and real browser gates; and never replace an asset with an unreviewed download.
+## Setup
 
-## Manual test checklist
+```bash
+npm install
+npm test
+npm run lint
+npm run test:e2e
+```
 
-Use a test account and synthetic messages. Run the applicable cases in [docs/TESTING.md](docs/TESTING.md), including every changed scope, rule, output, Stop/resume phase, download outcome, and migration path. Record what was actually tested; do not write “all tests passed” when Gmail/browser cases were not run.
+Load the folder at `chrome://extensions` with **Load unpacked**. After a change, press **Reload** on the extension card, then reopen the side panel. There is no build step, and no runtime dependencies: keep it that way unless the benefit is clear and reviewed.
+
+## Where things live
+
+| Path | Purpose |
+| --- | --- |
+| `sidepanel.*` | The only interface. Reads storage directly |
+| `content.js` | Scan and download engine, injected into Gmail on demand |
+| `background.js` | Storage access for `content.js`, and Chrome downloads |
+| `lib/gmail-adapter.js` | Everything that knows about Gmail's page |
+| `lib/gmail-date.js` | Reading Gmail's dates in any language |
+| `lib/filter-engine.js` | Rules that decide what matches |
+| `lib/export-engine.js`, `lib/exporter.js` | File formats, ZIP, encryption, export orchestration |
+| `lib/job-store.js`, `lib/job-machine.js` | Durable storage and job lifecycle |
+
+## Principles
+
+- **No silent loss.** If mail can't be captured, say so on screen and in the exports.
+- **Stay focused.** This finds and saves Gmail mail. Other features belong in other projects.
+- **Prove it through the UI.** A bug fix gets a test that fails without it, in `tests/e2e/run.mjs` when it involves Gmail or the panel.
 
 ## Pull requests
 
-Keep changes focused. Explain the user-facing behavior, privacy or permission impact, testing performed, and any Gmail selectors added or changed. Update README, export specification, privacy statement, and changelog when applicable.
-
-By contributing, you agree that your contribution is licensed under the MIT License.
-
-Participation is also governed by [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+Keep changes focused. Describe the user-facing behavior, privacy or permission impact, and what you tested, including whether you ran it on live Gmail. Update docs and the changelog where relevant. By contributing, you license your work under the MIT License. Participation is governed by [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).

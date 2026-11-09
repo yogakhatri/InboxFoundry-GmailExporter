@@ -1,0 +1,28 @@
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - name: Install Chromium
+        id: chromium
+        run: echo "path=$(npx --yes @puppeteer/browsers install chromium@stable --path "$RUNNER_TEMP/browsers" | tail -1 | cut -d' ' -f2-)" >> "$GITHUB_OUTPUT"
+      - name: End-to-end tests
+        run: npm run test:e2e
+        env:
+          INBOXFOUNDRY_CHROME: ${{ steps.chromium.outputs.path }}

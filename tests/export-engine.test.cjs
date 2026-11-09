@@ -1,98 +1,129 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 const engine = require('../lib/export-engine.js');
 
-const envelope = { job: { name: 'Batch 001', isPartial: false }, exportedAt: '2026-01-01', totals: { matchedThreads: 1, capturedMessages: 1 }, threads: [{ threadKey: 'abc', subject: '<Invoice>', messages: [{ from: 'a@example.com', recipients: ['b@example.com'], date: '2026-01-01', bodyTextRaw: 'Amount (paid)' }] }] };
+const record = (over = {}) => ({
+  recordId: 'record-1', subject: 'Résumé ✓\r\nBcc: attacker@example.com',
+  messages: [
+    { index: 1, messageId: 'abc123', from: 'sender@example.com', fromName: 'Zoë', recipients: ['r@example.com'], dateIso: '2026-01-02T03:04:05.000Z', bodyTextRaw: 'Hello 🌍', bodyHtmlRaw: '<b>Hello</b>', attachments: [{ fileName: 'résumé.pdf' }] },
+    { index: 2, messageId: 'def456', from: 'other@example.com', recipients: [], dateIso: null, bodyTextRaw: 'Second' }
+  ],
+  ...over
+});
+const envelope = { formatVersion: 3, job: { name: 'Batch', isPartial: false }, exportedAt: '2026-11-09T00:00:00.000Z', totals: { matchedThreads: 1, messages: 2 } };
+async function join(chunks) {
+  let text = '';
+  for await (const piece of chunks) text += piece;
+  return text;
+}
+const unzipEntries = async blob => {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const view = new DataView(bytes.buffer);
+  const entries = {};
+  let offset = 0;
+  while (view.getUint32(offset, true) === 0x04034b50) {
+    const size = view.getUint32(offset + 18, true);
+    const nameLength = view.getUint16(offset + 26, true);
+    const name = new TextDecoder().decode(bytes.subarray(offset + 30, offset + 30 + nameLength));
+    entries[name] = bytes.subarray(offset + 30 + nameLength, offset + 30 + nameLength + size);
+    offset += 30 + nameLength + size;
+  }
+  return entries;
+};
 
-test('creates self-contained escaped printable HTML', () => {
-  const html = engine.printableHtml(envelope);
+test('streamed JSON parses and its hashes verify', async () => {
+  const text = await join(engine.jsonChunks(envelope, [record(), record({ recordId: 'record-2' })]));
+  const parsed = JSON.parse(text);
+  assert.equal(parsed.threads.length, 2);
+  assert.equal(parsed.job.name, 'Batch');
+  assert.equal(parsed.integrity.threads[1].sha256, createHash('sha256').update(JSON.stringify(parsed.threads[1])).digest('hex'));
+  assert.equal(JSON.parse(await join(engine.jsonChunks(envelope, []))).threads.length, 0);
+});
+
+test('HTML escapes mail and carries no mail markup', async () => {
+  const html = await join(engine.htmlChunks(envelope, [record({ subject: '<script>alert(1)</script>' })]));
   assert.match(html, /^<!doctype html>/);
-  assert.match(html, /&lt;Invoice&gt;/);
-  assert.doesNotMatch(html, /<Invoice>/);
-  assert.match(html, /Search this local archive/);
+  assert.match(html, /&lt;script&gt;alert/);
+  assert.doesNotMatch(html, /<script>alert/);
+  assert.doesNotMatch(html, /<b>Hello/);
+  assert.match(html, /Hello 🌍/);
+  assert.match(html, /save as PDF/);
 });
 
-test('round-trips a passphrase-encrypted local archive', async () => {
-  const encrypted = await engine.encryptText('private mailbox record', 'correct horse battery staple');
-  assert.equal(JSON.parse(encrypted).cipher, 'AES-256-GCM');
-  assert.equal(await engine.decryptText(encrypted, 'correct horse battery staple'), 'private mailbox record');
-  await assert.rejects(engine.decryptText(encrypted, 'incorrect passphrase'));
-});
-
-test('splits envelopes without losing or repeating ordered threads', () => {
-  const source = { threads:[1,2,3,4,5].map(n => ({ threadKey:`t${n}` })), integrity:{ threads:[1,2,3,4,5].map(n => ({ threadKey:`t${n}`, sha256:`h${n}` })) } };
-  const parts = engine.splitEnvelope(source, 2);
-  assert.deepEqual(parts.map(part => part.threads.map(thread => thread.threadKey)), [['t1','t2'],['t3','t4'],['t5']]);
-  assert.deepEqual(parts.map(part => part.part), [{index:1,count:3},{index:2,count:3},{index:3,count:3}]);
-  assert.deepEqual(parts.flatMap(part => part.integrity.threads.map(item => item.threadKey)), ['t1','t2','t3','t4','t5']);
-});
-
-test('creates a structurally complete basic PDF', () => {
-  const pdf = engine.basicPdf(envelope);
-  assert.match(pdf, /^%PDF-1\.4/);
-  assert.match(pdf, /xref/);
-  assert.match(pdf, /%%EOF$/);
-  assert.ok(pdf.includes('Amount \\(paid\\)'));
-});
-
-test('neutralizes spreadsheet formulas and escapes quotes in CSV', () => {
+test('CSV neutralizes formulas, including after spaces, and handles quotes and missing bodies', async () => {
   assert.equal(engine.csvCell('=HYPERLINK("bad")'), '"\'=HYPERLINK(""bad"")"');
+  assert.equal(engine.csvCell('  =1+1'), '"\'  =1+1"');
   assert.equal(engine.csvCell('ordinary'), '"ordinary"');
+  assert.equal(engine.csvCell(undefined), '""');
+  const csv = await join(engine.messagesCsvChunks([{ recordId: 'r', subject: 's', messages: [{ index: 1, from: 'a@b.c' }] }]));
+  assert.ok(csv.startsWith('﻿'));
+  assert.doesNotMatch(csv, /undefined/);
 });
 
-test('creates a deterministic safe classic ZIP package', () => {
-  const zip = engine.zipArchive([
-    { name:'archive.json', data:'{"ok":true}' },
-    { name:'../unsafe/notes.txt', data:'hello' }
-  ]);
-  const view = new DataView(zip.buffer, zip.byteOffset, zip.byteLength);
-  assert.equal(view.getUint32(0, true), 0x04034b50);
-  assert.equal(view.getUint16(zip.length - 12, true), 2);
-  assert.equal(view.getUint32(zip.length - 22, true), 0x06054b50);
-  const text = new TextDecoder().decode(zip);
-  assert.match(text, /archive\.json/);
-  assert.match(text, /unsafe\/notes\.txt/);
-  assert.doesNotMatch(text, /\.\.\/unsafe/);
-  assert.deepEqual(zip, engine.zipArchive([{ name:'archive.json', data:'{"ok":true}' }, { name:'../unsafe/notes.txt', data:'hello' }]));
+test('rebuilt EML: injection-safe, UTF-8, threaded, honest about estimates', () => {
+  const thread = record();
+  const context = { exportedAt: '2026-11-09T00:00:00.000Z', jobId: 'job-1' };
+  const first = engine.reconstructedEml(thread, thread.messages[0], context);
+  assert.doesNotMatch(first, /\r\nBcc:/);
+  assert.match(first, /From: =\?UTF-8\?B\?.*\?= <sender@example\.com>\r\n/);
+  assert.match(first, /Date: Fri, 02 Jan 2026 03:04:05 GMT/);
+  assert.match(first, /multipart\/alternative/);
+  assert.match(first, /X-InboxFoundry-Reconstructed: true/);
+  assert.doesNotMatch(first, /Date-Estimated/);
+  const second = engine.reconstructedEml(thread, thread.messages[1], context);
+  assert.match(second, /In-Reply-To: <inboxfoundry-abc123@local\.invalid>/);
+  assert.match(second, /X-InboxFoundry-Date-Estimated: true/);
+  const body = second.split('\r\n\r\n')[1].replace(/\r\n/g, '');
+  assert.equal(Buffer.from(body, 'base64').toString('utf8'), 'Second');
 });
 
-test('creates safely named individual PDF entries without losing thread order', () => {
-  const source = { job:{ name:'Batch' }, totals:{ matchedThreads:2, capturedMessages:2 }, threads:[
-    { threadKey:'a', subject:'../Invoice: 1', messages:[{ bodyTextRaw:'one' }] },
-    { threadKey:'b', subject:'Contract', messages:[{ bodyTextRaw:'two' }] }
-  ] };
-  const entries = engine.individualPdfEntries(source);
-  assert.deepEqual(entries.map(entry => entry.threadKey), ['a','b']);
-  assert.equal(entries[0].name, '00001 - __Invoice_ 1.pdf');
-  assert.match(entries[0].data, /^%PDF-1\.4/);
-  assert.match(entries[1].data, /%%EOF$/);
+test('Message-IDs differ between batches when Gmail IDs are withheld', () => {
+  const thread = { recordId: 'record-000001', subject: 's', messages: [{ index: 1, from: 'a@b.c', bodyTextRaw: 'x' }] };
+  const id = job => engine.reconstructedEml(thread, thread.messages[0], { jobId: job }).match(/Message-ID: (.*)\r/)[1];
+  assert.notEqual(id('job-1'), id('job-2'));
 });
 
-test('creates injection-safe reconstructed EML with UTF-8 content', () => {
-  const source = { exportedAt:'2026-01-01T00:00:00Z', threads:[{ subject:'Résumé ✓\r\nBcc: attacker@example.com', messages:[{
-    index:7, from:'Sender <sender@example.com>\r\nX-Evil: yes', recipients:['recipient@example.com'], date:'2026-01-02T03:04:05Z', bodyTextRaw:'Hello 🌍', attachments:[{ fileName:'résumé.pdf' }]
-  }] }] };
-  const entries = engine.emlEntries(source);
-  assert.equal(entries.length, 1);
-  assert.equal(entries[0].name, '00001 - Résumé ✓__Bcc_ attacker@example.com/message-001.eml');
-  assert.match(entries[0].data, /X-InboxFoundry-Reconstructed: true/);
-  assert.match(entries[0].data, /not original raw RFC 5322 source/);
-  assert.match(entries[0].data, /From: Sender <sender@example\.com> X-Evil: yes\r\n/);
-  assert.doesNotMatch(entries[0].data, /\r\nX-Evil:/);
-  const body = entries[0].data.split('\r\n\r\n')[1].replace(/\r\n/g, '');
-  assert.equal(Buffer.from(body, 'base64').toString('utf8'), 'Hello 🌍');
-});
-
-test('creates importable reconstructed MBOX records without exposing internal keys', () => {
-  const source = { exportedAt:'2026-01-01T00:00:00Z', threads:[
-    { threadKey:'private-thread-key', subject:'One', messages:[{ from:'Alice <alice@example.com>', date:'bad date', bodyTextRaw:'First' }] },
-    { subject:'Two', messages:[{ from:'unknown sender', bodyTextRaw:'Second' }] }
-  ] };
-  const mbox = engine.reconstructedMbox(source);
+test('MBOX has one record per message and never a date from nowhere', async () => {
+  const mbox = await join(engine.mboxChunks([record()], { exportedAt: '2026-11-09T00:00:00.000Z', jobId: 'j' }));
   assert.equal((mbox.match(/^From /gm) || []).length, 2);
-  assert.match(mbox, /^From alice@example\.com Thu Jan {2}1 00:00:00 2026\r$/m);
-  assert.match(mbox, /Date: Thu, 01 Jan 2026 00:00:00 GMT/);
-  assert.match(mbox, /From MAILER-DAEMON /);
-  assert.doesNotMatch(mbox, /private-thread-key/);
-  assert.equal((mbox.match(/X-InboxFoundry-Reconstructed: true/g) || []).length, 2);
+  assert.match(mbox, /^From sender@example\.com Fri Jan {2}2 03:04:05 2026\r$/m);
+});
+
+test('ZIP entries are safe, unique, deterministic, and checksummed', async () => {
+  const build = async () => {
+    const zip = new engine.ZipBuilder();
+    await zip.add('archive.json', '{"ok":true}');
+    await zip.add('../unsafe/notes.txt', 'hello');
+    await zip.add('archive.json', 'second');
+    await zip.add('bytes.bin', (async function* pieces() { yield 'caf'; yield new Uint8Array([0xc3, 0xa9]); })());
+    await zip.addChecksums();
+    return zip.finish();
+  };
+  const blob = await build();
+  const entries = await unzipEntries(blob);
+  assert.deepEqual(Object.keys(entries), ['archive.json', 'unsafe/notes.txt', 'archive (2).json', 'bytes.bin', 'CHECKSUMS.sha256']);
+  assert.equal(new TextDecoder().decode(entries['bytes.bin']), 'café');
+  const sums = new TextDecoder().decode(entries['CHECKSUMS.sha256']);
+  assert.ok(sums.includes(`${createHash('sha256').update('hello').digest('hex')}  unsafe/notes.txt`));
+  assert.deepEqual(new Uint8Array(await blob.arrayBuffer()), new Uint8Array(await (await build()).arrayBuffer()));
+  assert.throws(() => new engine.ZipBuilder().finish(), /at least one/);
+});
+
+test('encryption round-trips across chunks and rejects tampering', async () => {
+  const plain = new Blob([new Uint8Array(1000).fill(7), 'tail']);
+  const options = { chunkSize: 256, iterations: 1000 };
+  const encrypted = await engine.encryptBlob(plain, 'correct horse battery', options);
+  const round = await engine.decryptBlob(encrypted, 'correct horse battery');
+  assert.deepEqual(new Uint8Array(await round.blob.arrayBuffer()), new Uint8Array(await plain.arrayBuffer()));
+  await assert.rejects(engine.decryptBlob(encrypted, 'wrong passphrase'));
+  await assert.rejects(engine.decryptBlob(encrypted.slice(0, encrypted.size - 300), 'correct horse battery'));
+  const bytes = new Uint8Array(await encrypted.arrayBuffer());
+  bytes[bytes.length - 1] ^= 1;
+  await assert.rejects(engine.decryptBlob(new Blob([bytes]), 'correct horse battery'));
+  await assert.rejects(engine.encryptBlob(plain, 'short'));
+  await assert.rejects(engine.decryptBlob(new Blob(['not encrypted']), 'correct horse battery'), /not an InboxFoundry/);
+  assert.ok(engine.PBKDF2_ITERATIONS >= 600000);
+  const empty = await engine.encryptBlob(new Blob([]), 'correct horse battery', options);
+  assert.equal((await engine.decryptBlob(empty, 'correct horse battery')).blob.size, 0);
 });

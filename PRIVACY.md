@@ -1,34 +1,47 @@
 # Privacy
 
-Last updated: August 30, 2026
+Last updated: November 9, 2026
 
-InboxFoundry is designed to process data locally in the user's browser.
+InboxFoundry works entirely in your browser. It has no server, account, analytics, advertising, or telemetry, and contains no remote code.
 
-## Data the extension accesses
+## What it reads
 
-When the user starts an export, the extension reads content that Gmail exposes in the active mailbox interface, including thread subjects, message headers, sender and recipient information, dates, message text, message HTML, attachment names, and attachment download controls.
+Only after you start a search, it reads what Gmail shows in the active tab: subjects, senders, recipients, dates, message text and HTML, attachment names and sizes, and attachment download links. Until you use the side panel, no InboxFoundry code runs in Gmail.
 
-The optional local file inspector reads only files the user explicitly chooses through Chrome's file picker. It can hash selected files, temporarily decode supported text-like PDF, DOCX, XLSX, PPTX, and ordinary text files, and—only when separately enabled—recognize English text in supported images and scanned PDFs. OCR uses bundled local model and renderer files; it does not use a CDN or remote recognition service. The inspector does not automatically scan Downloads or any folder.
+## What it changes in Gmail
 
-## How data is used and stored
+It opens conversations the way you would, so **Gmail marks them as read**. It records how many were unread when opened and shows you. It doesn't send, delete, archive, or label anything.
 
-- Captured thread and message data is stored locally using Chrome extension storage so the export can resume and the user can download JSON later.
-- Generated JSON is saved to the user's configured Downloads directory.
-- Job records are checkpointed in extension-owned IndexedDB; small settings use extension local storage.
-- When selected, attachments are downloaded through Chrome into `InboxFoundry` below the configured Downloads directory.
-- The side panel requires a one-time plain-language acknowledgement before the first export.
-- Optional archive encryption and decryption happen locally with Web Crypto. Passphrases are used only for the current action and are not persisted.
-- Local file-inspector text, including OCR-recognized text, remains only in side-panel memory until the inspector is cleared or the panel closes. OCR cancellation terminates its local worker. Large selected files are hashed incrementally in bounded chunks and are not copied into extension storage. Exported inspector reports contain filenames, metadata, hashes, duplicate groups, OCR engine metadata, the user's search query, and match counts, but not full extracted/OCR text, OCR page segments, or search snippets. Local classification, likely-sensitive-pattern findings, and structured field suggestions are excluded unless the user explicitly approves their inclusion. Optional redacted text copies are generated only on request and may still contain sensitive material that detection or OCR missed.
-- Data remains until the user selects **Delete saved export data**, removes the extension, clears the extension's storage, or deletes downloaded files.
+## Where data goes
 
-## Data sharing and network use
+- Captured mail is stored in this browser's extension storage (IndexedDB) so you can review, resume, and save it.
+- Files you save go to your Downloads folder under `InboxFoundry`.
+- A list of what you've already exported, holding Gmail thread and message IDs but no content, is kept so repeat exports can skip it. Clear it with **Forget what was already saved**.
+- Your search form and saved searches are stored locally and may contain addresses or terms you typed.
 
-The extension does not transmit captured mailbox data to the project maintainers or to an analytics, advertising, telemetry, or other third-party service. It does not contain remote code.
+The extension sends mail data nowhere. Attachment downloads are requests to Google using your existing Gmail session. Chrome may apply its own services, such as download safety checks, according to your browser settings.
 
-Gmail and attachment requests still communicate with Google as part of the user's existing Gmail session. Chrome may provide browser services such as download reputation checks according to the user's browser configuration; those services are outside this project's control.
+## Keeping and deleting
 
-## User responsibility
+Nothing is deleted automatically. Captured mail stays until you delete the batch, delete all batches, remove the extension, or clear its storage. Deleting a batch doesn't touch files already saved to disk.
 
-Exported email may contain personal, confidential, regulated, or copyrighted information. Users are responsible for authorization to export it, secure storage, retention, sharing, and deletion.
+## Encryption and hiding addresses
 
-Because this source-distributed project can be modified by anyone, this statement applies to the unmodified source in this repository. Review changes before installing a fork.
+- **Encrypt** writes one passphrase-protected file (AES-256-GCM, PBKDF2 with 600,000 iterations) and no plain export copy. The passphrase is never stored. Attachments aren't encrypted, and captured mail stays readable in the browser until you delete the batch.
+- **Hide email addresses** replaces addresses in saved records, including bodies and HTML, on a best-effort basis. Names written out in text aren't detected. Check before sharing.
+
+## Permissions
+
+| Permission | Why |
+| --- | --- |
+| `https://mail.google.com/*` | Read the Gmail page you search, only in the tab you use |
+| `scripting` | Load the reading code into Gmail only when you start something |
+| `downloads` | Save attachments and exports into folders and track their progress |
+| `storage`, `unlimitedStorage` | Keep settings and captured mail locally, however large the batch |
+| `sidePanel` | Show the interface beside Gmail |
+
+## Your responsibility
+
+Exported mail can contain personal or confidential information, including other people's. You are responsible for having the right to export it and for storing and sharing it safely.
+
+This statement covers the unmodified source in this repository. Review changes before installing a fork.

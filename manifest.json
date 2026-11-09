@@ -1,33 +1,25 @@
 {
   "manifest_version": 3,
-  "name": "InboxFoundry — Gmail Exporter",
-  "version": "4.5.0",
-  "minimum_chrome_version": "114",
-  "description": "Privately filter, organize, and export Gmail conversations and attachments on your device.",
+  "name": "InboxFoundry for Gmail",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "description": "Find exactly the Gmail conversations and attachments you need and save them to your computer. No account, no server.",
   "icons": {
     "16": "assets/icon16.png",
     "32": "assets/icon32.png",
     "48": "assets/icon48.png",
     "128": "assets/icon128.png"
   },
-  "permissions": [
-    "storage",
-    "downloads",
-    "sidePanel",
-    "unlimitedStorage"
-  ],
-  "host_permissions": [
-    "https://mail.google.com/*"
-  ],
+  "permissions": ["downloads", "scripting", "sidePanel", "storage", "unlimitedStorage"],
+  "host_permissions": ["https://mail.google.com/*"],
   "background": {
     "service_worker": "background.js"
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; object-src 'self'"
+    "extension_pages": "script-src 'self'; object-src 'none'; base-uri 'none'"
   },
   "action": {
     "default_title": "Open InboxFoundry",
-    "default_popup": "popup.html",
     "default_icon": {
       "16": "assets/icon16.png",
       "32": "assets/icon32.png"
@@ -35,23 +27,5 @@
   },
   "side_panel": {
     "default_path": "sidepanel.html"
-  },
-  "content_scripts": [
-    {
-      "matches": [
-        "https://mail.google.com/*"
-      ],
-      "js": [
-        "lib/product-schema.js",
-        "lib/job-machine.js",
-        "lib/path-safety.js",
-        "lib/gmail-adapter.js",
-        "lib/filter-engine.js",
-        "lib/attachment-analysis.js",
-        "lib/export-engine.js",
-        "content.js"
-      ],
-      "run_at": "document_idle"
-    }
-  ]
+  }
 }

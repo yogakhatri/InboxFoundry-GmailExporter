@@ -7,15 +7,10 @@ const root = resolve(import.meta.dirname, '..');
 const manifest = JSON.parse(await readFile(resolve(root, 'manifest.json'), 'utf8'));
 const files = [
   'manifest.json', 'background.js', 'content.js',
-  'popup.html', 'popup.css', 'popup.js',
-  'sidepanel.html', 'sidepanel.css', 'sidepanel.js', 'disclosure.css',
-  'lib/product-schema.js', 'lib/gmail-query.js', 'lib/job-machine.js',
-  'lib/path-safety.js', 'lib/gmail-adapter.js', 'lib/filter-engine.js', 'lib/export-engine.js',
-  'lib/attachment-analysis.js', 'lib/text-intelligence.js', 'lib/sha256.js', 'lib/pdf-parser.js', 'lib/office-parser.js', 'lib/ocr-engine.js', 'lib/local-file-analysis.js', 'lib/download-policy.js', 'lib/job-store.js',
-  'vendor/ASSET_MANIFEST.json', 'vendor/THIRD_PARTY_NOTICES.md',
-  'vendor/tesseract/tesseract.min.js', 'vendor/tesseract/tesseract.min.js.LICENSE.txt', 'vendor/tesseract/worker.min.js', 'vendor/tesseract/worker.min.js.LICENSE.txt',
-  'vendor/tesseract/tesseract-core-simd-lstm.wasm.js', 'vendor/tesseract/lang/eng.traineddata.gz', 'vendor/tesseract/LICENSE-tesseract-js.md', 'vendor/tesseract/LICENSE-tesseract-core.txt', 'vendor/tesseract/LICENSE-language-model.json', 'vendor/tesseract/README-language-model.md',
-  'vendor/pdfjs/pdf.min.mjs', 'vendor/pdfjs/pdf.worker.min.mjs', 'vendor/pdfjs/LICENSE.txt',
+  'sidepanel.html', 'sidepanel.css', 'sidepanel.js',
+  'lib/attachment-analysis.js', 'lib/export-engine.js', 'lib/exporter.js', 'lib/filter-engine.js', 'lib/gmail-adapter.js',
+  'lib/gmail-date.js', 'lib/gmail-query.js', 'lib/job-machine.js', 'lib/job-store.js', 'lib/path-safety.js',
+  'lib/product-schema.js', 'lib/sha256.js',
   'assets/icon16.png', 'assets/icon32.png', 'assets/icon48.png', 'assets/icon128.png',
   'LICENSE', 'PRIVACY.md', 'SECURITY.md'
 ];

@@ -1,301 +1,915 @@
-const $ = id => document.getElementById(id);
-const schema = globalThis.InboxFoundry.schema;
-const gmailQueryEngine = globalThis.InboxFoundry.gmailQuery;
-const filterEngine = globalThis.InboxFoundry.filterEngine;
-const attachmentAnalysis = globalThis.InboxFoundry.attachmentAnalysis;
-const localFileAnalysis = globalThis.InboxFoundry.localFileAnalysis;
-const ocrEngine = globalThis.InboxFoundry.ocrEngine;
-const textIntelligence = globalThis.InboxFoundry.textIntelligence;
-const exportEngine = globalThis.InboxFoundry.exportEngine;
-let initialized = false;
-let privacyAcknowledged = false;
-let attachmentWorkspaceJobId = null;
-let localFileResults = [];
-let localAnalysisController = null;
-function escapeHtml(value) { return String(value ?? '').replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[char]); }
-const STARTERS = {
-  invoices: { email: { includeTerms: ['invoice','receipt','statement'], fields: ['subject','body','attachmentNames'] }, attachments: { action:'matching', typeGroups:['pdf','spreadsheet'], filenameInclude:['invoice','receipt','statement'] } },
-  contracts: { email: { includeTerms: ['contract','agreement','signed'], fields: ['subject','body','attachmentNames'] }, attachments: { action:'matching', typeGroups:['pdf','document'], filenameInclude:['contract','agreement','signed'] } },
-  realestate: { email: { includeTerms: ['closing','escrow','purchase agreement','inspection','title'], fields: ['subject','body','attachmentNames'] }, attachments: { action:'matching', typeGroups:['pdf','document','spreadsheet'] }, output:{ folderTemplate:'{batch}/{senderDomain}/{date} - {subject}' } },
-  resumes: { email: { includeTerms: ['resume','résumé','cv','application'], fields: ['subject','body','attachmentNames'] }, attachments: { action:'matching', typeGroups:['pdf','document'] } },
-  travel: { email: { includeTerms: ['itinerary','quotation','voucher','booking','rate'], fields: ['subject','body','attachmentNames'] }, attachments: { action:'matching', typeGroups:['pdf','document','spreadsheet','emailCalendarContact'] } },
-  insurance: { email: { includeTerms: ['claim','policy','adjuster','loss','settlement'], fields: ['subject','body','attachmentNames'] }, attachments: { action:'matching', typeGroups:['pdf','document','image'] } },
-  procurement: { email: { includeTerms: ['quotation','quote','purchase order','vendor','rfq'], fields: ['subject','body','attachmentNames'] }, attachments: { action:'matching', typeGroups:['pdf','document','spreadsheet'] } },
-  projects: { email: { includeTerms: ['approval','approved','deliverable','milestone','sign-off'], fields: ['subject','body','attachmentNames'] }, attachments: { action:'matching', typeGroups:['pdf','document','spreadsheet','presentation','archive'] } },
-  education: { email: { includeTerms: ['account','transcript','certificate','course','offboarding'], fields: ['subject','body','attachmentNames'] }, attachments: { action:'matching', typeGroups:['pdf','document','spreadsheet'] } },
-  research: { email: { includeTerms: ['paper','preprint','manuscript','research'], fields: ['subject','body','attachmentNames'] }, attachments: { action:'matching', typeGroups:['pdf'] } },
-  spreadsheets: { email: { requireMatchingAttachment:true }, attachments: { action:'matching', typeGroups:['spreadsheet'] } }
+// The side panel: the only user interface. It reads storage directly and asks the Gmail tab's script to act.
+const { schema, jobMachine, gmailQuery, attachmentAnalysis, jobStore: store, exportEngine, exporter, pathSafety } = globalThis.InboxFoundry;
+
+const CONSENT_KEY = 'inboxFoundryPrivacyAcknowledgedV1';
+const CURRENT_JOB_KEY = 'inboxFoundryCurrentJobId';
+const FORM_KEY = 'inboxFoundryForm';
+const LARGE_SCAN_WARNING = 200;
+const SECONDS_PER_THREAD = 3;
+const CONTENT_FILES = [
+  'lib/product-schema.js', 'lib/job-machine.js', 'lib/path-safety.js', 'lib/gmail-date.js',
+  'lib/gmail-adapter.js', 'lib/filter-engine.js', 'content.js'
+];
+const FORM_FIELD_IDS = [
+  'scopeMode', 'fFrom', 'fTo', 'fSubject', 'fKeywords', 'fAfter', 'fBefore', 'fLabel', 'fFilename', 'fFileType',
+  'customQuery', 'largerMb', 'smallerMb', 'inAnywhere', 'incremental', 'includeTerms', 'excludeTerms', 'includeMode',
+  'matchType', 'wholeWord', 'caseSensitive', 'threadMode', 'ruleScope', 'filenameExclude', 'customExtensions', 'minMb',
+  'maxMb', 'excludeClutter', 'rootFolder', 'folderTemplate', 'contentMode', 'includeRawHtml', 'includeGmailUrls',
+  'includeInternalIds', 'redactAddresses', 'pacingMs', 'maxThreads', 'maxInspected'
+];
+const STATE_LABELS = {
+  draft: 'Preparing', running: 'Scanning', pausing: 'Stopping', stopped: 'Stopped', ready: 'Ready to review',
+  downloading: 'Saving files', failed: 'Needs attention', interrupted: 'Interrupted'
+};
+const FILE_STATE_LABELS = {
+  discovered: 'not saved yet', skipped: 'not requested', unavailable: 'cannot download', pending: 'queued', in_progress: 'saving',
+  complete: 'saved', interrupted: 'interrupted', failed: 'failed', erased: 'removed from Chrome'
 };
 
-function list(id) { return schema.normalizeStringList($(id).value); }
-function checked(container) { return [...$(container).querySelectorAll('input:checked')].map(input => input.value); }
-function bytes(id) { const n = Number($(id).value); return Number.isFinite(n) && n >= 0 && $(id).value !== '' ? Math.round(n * 1024 * 1024) : null; }
-function numberOrNull(id) { const value = $(id).value; const n = Number(value); return value !== '' && Number.isFinite(n) ? n : null; }
-function setList(id, values) { $(id).value = (values || []).join('\n'); }
-function setChecks(container, values) { const selected = new Set(values || []); for (const input of $(container).querySelectorAll('input')) input.checked = selected.has(input.value); }
+const $ = id => document.getElementById(id);
+let consented = false;
+let currentJob = null;
+let shownJobKey = '';
+let missedPings = 0;
+let formatsTouched = false;
+let lastStage = '';
+let threadCursor = -1;
+let fileCursor = -1;
+let exporting = false;
+let pendingPassphrase = '';
 
-function readConfig() {
-  return schema.normalizeConfig({
-    source: { mode: $('scopeMode').value, gmailQuery: gmailQuery(), incremental: $('incremental').checked, pacingMs: Number($('pacingMs').value) || 300, maxMatchedThreads: Math.min(250, Math.max(1, Number($('maxThreads').value) || 250)) },
-    email: {
-      includeTerms: list('includeTerms'), excludeTerms: list('excludeTerms'), includeMode: $('includeMode').value,
-      matchType: $('matchType').value, caseSensitive: $('caseSensitive').checked, wholeWord: $('wholeWord').checked,
-      fields: checked('fields'), threadMode: $('threadMode').value, senderInclude: list('senderInclude'), senderExclude: list('senderExclude'),
-      recipientInclude: list('recipientInclude'), recipientExclude: list('recipientExclude'),
-      domainInclude: list('domainInclude'), domainExclude: list('domainExclude'), subjectInclude: list('subjectInclude'), subjectExclude: list('subjectExclude'),
-      dateFrom: $('dateFrom').value, dateTo: $('dateTo').value, attachmentPresence: $('attachmentPresence').value,
-      minMessages: numberOrNull('minMessages'), maxMessages: numberOrNull('maxMessages'),
-      requireMatchingAttachment: $('requireMatchingAttachment').checked, exclusionsOverride: true, ruleScope: $('ruleScope').value
-    },
-    attachments: {
-      action: $('attachmentAction').value, typeGroups: checked('fileTypes'), customExtensions: list('customExtensions'),
-      filenameInclude: list('filenameInclude'), filenameExclude: list('filenameExclude'), includeMode: $('attachmentIncludeMode').value, matchType: $('attachmentMatchType').value,
-      caseSensitive: $('attachmentCaseSensitive').checked, includeInline: $('includeInline').checked, excludeClutter: $('excludeClutter').checked, minBytes: bytes('minMb'), maxBytes: bytes('maxMb'), unknownSize: 'include',
-      maxDownloads: Math.min(500, Math.max(0, Number($('maxDownloads').value) || 0))
-    },
-    destination: { type: $('destinationType').value, rootFolder: $('rootFolder').value.trim() || 'InboxFoundry' },
-    output: { formats: checked('formats'), contentMode: $('contentMode').value, includeRawHtml: $('includeRawHtml').checked, includeGmailUrls: $('includeGmailUrls').checked, includeInternalIds: $('includeInternalIds').checked, redactAddresses: $('redactAddresses').checked, prettyJson: true,
-      autoExportOnComplete: $('autoComplete').checked, autoExportOnStop: $('autoStop').checked, folderTemplate: $('folderTemplate').value.trim() || '{batch}/{index} - {subject}', splitRecords: numberOrNull('splitRecords') }
+// ---- Messages: stay on screen until dismissed or replaced, so an error can't vanish unread ----
+
+function notice(message, kind = 'error') {
+  $('noticeText').textContent = message || '';
+  $('notice').hidden = !message;
+  $('notice').classList.toggle('info', kind === 'info');
+}
+
+function guarded(handler) {
+  return async event => {
+    try {
+      await handler(event);
+    } catch (error) {
+      notice(friendlyError(error));
+    }
+  };
+}
+
+function friendlyError(error) {
+  const text = error?.message || String(error);
+  if (/quota|QuotaExceeded/i.test(text)) return 'Your disk or browser storage is full. Free some space or delete old batches, then resume.';
+  return text;
+}
+
+// ---- Talking to Gmail ----
+
+async function activeGmailTab() {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab?.id && tab.url?.startsWith('https://mail.google.com/') ? tab : null;
+}
+
+async function requireGmailTab() {
+  const tab = await activeGmailTab();
+  if (!tab) throw new Error('Open Gmail in this window first, then try again.');
+  return tab;
+}
+
+function askTab(tabId, type, extra = {}) {
+  return chrome.tabs.sendMessage(tabId, { type, ...extra });
+}
+
+/** Loads the Gmail script only when it's needed, so InboxFoundry does nothing in Gmail until asked. */
+async function ensureInjected(tabId) {
+  try {
+    if ((await askTab(tabId, 'PING'))?.alive) return;
+  } catch {
+    // Not there yet: inject below.
+  }
+  await chrome.scripting.executeScript({ target: { tabId }, files: CONTENT_FILES });
+}
+
+async function command(type, extra = {}, tabId = null) {
+  const id = tabId ?? (await requireGmailTab()).id;
+  await ensureInjected(id);
+  const response = await askTab(id, type, extra);
+  if (!response?.ok) throw new Error(response?.error || 'Gmail did not respond. Reload the Gmail tab and try again.');
+  return response;
+}
+
+// ---- The form ----
+
+const selectedIntent = () => document.querySelector('input[name="intent"]:checked')?.value || 'attachments';
+const checkedValues = id => [...$(id).querySelectorAll('input:checked')].map(input => input.value);
+const megabytes = id => {
+  const value = Number($(id).value);
+  return $(id).value !== '' && Number.isFinite(value) && value >= 0 ? Math.round(value * 1048576) : null;
+};
+
+function usesSearchFields() {
+  return ['current-view', 'current-page'].includes($('scopeMode').value);
+}
+
+function buildQuery() {
+  if (!usesSearchFields()) return '';
+  const intent = selectedIntent();
+  const fileTerms = schema.parseTerms($('fFilename').value);
+  return gmailQuery.build({
+    raw: $('customQuery').value,
+    keywords: $('fKeywords').value,
+    from: $('fFrom').value,
+    to: $('fTo').value,
+    subject: $('fSubject').value,
+    label: $('fLabel').value,
+    filename: intent !== 'emails' && fileTerms.length === 1 ? fileTerms[0] : '',
+    after: $('fAfter').value,
+    before: $('fBefore').value,
+    largerMb: $('largerMb').value,
+    smallerMb: $('smallerMb').value,
+    hasAttachment: intent === 'attachments',
+    inAnywhere: $('inAnywhere').checked
   });
 }
 
-function writeConfig(input) {
-  const c = schema.normalizeConfig(input);
-  $('scopeMode').value = c.source.mode || 'current-view';
-  $('incremental').checked = !!c.source.incremental;
-  $('pacingMs').value = String(c.source.pacingMs || 300);
-  $('gmailQuery').value = c.source.gmailQuery || '';
-  for (const id of ['queryFrom','queryTo','querySubject','queryFilename','queryAfter','queryBefore','queryLabel','queryCategory','queryLarger','querySmaller','queryStatus']) $(id).value = '';
-  for (const id of ['queryAttachment','queryAnywhere']) $(id).checked = false;
-  setList('includeTerms', c.email.includeTerms); setList('excludeTerms', c.email.excludeTerms); $('includeMode').value = c.email.includeMode;
-  $('matchType').value = c.email.matchType; $('caseSensitive').checked = c.email.caseSensitive; $('wholeWord').checked = c.email.wholeWord;
-  setChecks('fields', c.email.fields); $('threadMode').value = c.email.threadMode; setList('senderInclude', c.email.senderInclude); setList('senderExclude', c.email.senderExclude);
-  setList('recipientInclude', c.email.recipientInclude); setList('recipientExclude', c.email.recipientExclude);
-  setList('domainInclude', c.email.domainInclude); setList('domainExclude', c.email.domainExclude); setList('subjectInclude', c.email.subjectInclude); setList('subjectExclude', c.email.subjectExclude);
-  $('dateFrom').value = c.email.dateFrom; $('dateTo').value = c.email.dateTo; $('attachmentPresence').value = c.email.attachmentPresence || 'any'; $('minMessages').value = c.email.minMessages ?? ''; $('maxMessages').value = c.email.maxMessages ?? ''; $('ruleScope').value = c.email.ruleScope || 'single-message'; $('requireMatchingAttachment').checked = c.email.requireMatchingAttachment;
-  $('attachmentAction').value = c.attachments.action; setChecks('fileTypes', c.attachments.typeGroups); setList('customExtensions', c.attachments.customExtensions);
-  setList('filenameInclude', c.attachments.filenameInclude); setList('filenameExclude', c.attachments.filenameExclude); $('includeInline').checked = c.attachments.includeInline;
-  $('excludeClutter').checked = c.attachments.excludeClutter !== false;
-  $('attachmentIncludeMode').value = c.attachments.includeMode || 'any'; $('attachmentMatchType').value = c.attachments.matchType || 'contains'; $('attachmentCaseSensitive').checked = !!c.attachments.caseSensitive;
-  $('minMb').value = c.attachments.minBytes == null ? '' : c.attachments.minBytes / 1048576; $('maxMb').value = c.attachments.maxBytes == null ? '' : c.attachments.maxBytes / 1048576;
-  $('maxThreads').value = c.source.maxMatchedThreads; $('maxDownloads').value = c.attachments.maxDownloads; setChecks('formats', c.output.formats);
-  $('includeRawHtml').checked = c.output.includeRawHtml; $('includeGmailUrls').checked = c.output.includeGmailUrls !== false; $('includeInternalIds').checked = c.output.includeInternalIds !== false; $('autoComplete').checked = c.output.autoExportOnComplete; $('autoStop').checked = c.output.autoExportOnStop;
-  $('redactAddresses').checked = !!c.output.redactAddresses;
-  $('contentMode').value = c.output.contentMode || 'full';
-  $('folderTemplate').value = c.output.folderTemplate || '{batch}/{index} - {subject}';
-  $('destinationType').value = c.destination?.type || 'downloads'; $('rootFolder').value = c.destination?.rootFolder || 'InboxFoundry';
-  $('splitRecords').value = c.output.splitRecords ?? '';
-  summarize();
-}
-
-async function gmailTab() { const [tab] = await chrome.tabs.query({ active: true, currentWindow: true }); if (!tab?.id || !tab.url?.startsWith('https://mail.google.com/')) throw new Error('Open Gmail in the active tab.'); return tab; }
-async function send(type, extra = {}) { try { const tab = await gmailTab(); const r = await chrome.tabs.sendMessage(tab.id, { type, ...extra }); if (!r?.ok) throw new Error(r?.error || 'Action failed.'); notice(''); return r; } catch (error) { notice(error.message?.includes('Receiving end') ? 'Reload Gmail once to activate this extension.' : error.message); return null; } }
-function notice(message) { $('notice').textContent = message || ''; $('notice').hidden = !message; }
-function summarize() { const c = readConfig(); $('emailSummary').textContent = c.email.includeTerms.length ? `${c.email.includeMode.toUpperCase()} · ${c.email.includeTerms.length} term${c.email.includeTerms.length === 1 ? '' : 's'}` : 'All emails'; $('attachmentSummary').textContent = ({ all:'Download all', matching:'Matching only', metadata:'Metadata only', none:'No files' })[c.attachments.action]; }
-function formatBytes(value) { const n = Number(value); if (!Number.isFinite(n) || n < 0) return 'unknown size'; if (n < 1024) return `${n} B`; if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`; return `${(n / 1048576).toFixed(1)} MB`; }
-
-function fileRow({ id, fileName, meta, state, kind, checked = false, selectable = true }) {
-  const label = document.createElement('label'); label.className = `file-row${selectable ? '' : ' no-select'}`;
-  const input = document.createElement('input'); input.type = 'checkbox'; input.checked = checked; input.dataset.kind = kind; input.dataset.id = String(id || ''); input.dataset.filename = String(fileName || 'attachment'); input.hidden = !selectable;
-  const main = document.createElement('span'); main.className = 'file-main';
-  const name = document.createElement('strong'); name.className = 'file-name'; name.textContent = fileName || 'Unnamed attachment';
-  const detail = document.createElement('small'); detail.className = 'file-meta'; detail.textContent = meta || '';
-  const badge = document.createElement('span'); badge.className = `state ${['failed','interrupted','erased'].includes(state) ? 'problem' : ''}`; badge.textContent = state || 'detected';
-  main.append(name, detail); label.append(input, main, badge); return label;
-}
-
-async function loadAttachmentWorkspace(jobId = attachmentWorkspaceJobId) {
-  attachmentWorkspaceJobId = jobId || null;
-  $('attachmentWorkspace').replaceChildren(); $('downloadWorkspace').replaceChildren();
-  if (!jobId) { $('attachmentWorkspaceSummary').textContent = 'No saved batch'; $('attachmentGroups').textContent = ''; return; }
-  const [attachments, downloads] = await Promise.all([
-    db('DB_GET_ATTACHMENTS', { jobId }), db('DB_GET_DOWNLOADS', { jobId })
-  ]);
-  for (const row of attachments.slice(0, 500)) {
-    const groups = row.classification?.groups?.join(', ') || row.classification?.extension || 'other';
-    const reasons = (row.reasons || []).join(', ');
-    $('attachmentWorkspace').append(fileRow({ id:row.id, fileName:row.fileName, kind:'attachment', state:row.matched ? 'matched' : 'excluded', meta:`Message ${row.messageIndex || '?'} · ${formatBytes(row.sizeBytes)} · ${groups}${reasons ? ` · ${reasons}` : ''}` }));
-  }
-  if (!attachments.length) $('attachmentWorkspace').textContent = 'No saved attachment decisions yet.';
-  const groups = attachmentAnalysis.analyze(attachments);
-  const duplicateNames = groups.duplicateCandidateGroups.slice(0, 5).map(group => group.items.map(item => item.fileName).join(' × '));
-  const versionNames = groups.versionCandidateGroups.slice(0, 5).map(group => group.items.map(item => item.fileName).join(' → '));
-  $('attachmentGroups').textContent = [
-    `${groups.duplicateCandidateGroups.length} metadata duplicate candidate group(s); ${groups.versionCandidateGroups.length} filename version family/families.`,
-    duplicateNames.length ? `Duplicates: ${duplicateNames.join(' · ')}` : '',
-    versionNames.length ? `Versions: ${versionNames.join(' · ')}` : '',
-    'These are filename/known-size hints, not content-hash proof.'
-  ].filter(Boolean).join(' ');
-  for (const row of downloads.slice(0, 500)) {
-    $('downloadWorkspace').append(fileRow({ id:row.id, fileName:row.fileName, kind:'download', state:row.state, meta:`${row.method || 'queued'}${row.error ? ` · ${row.error}` : ''}` }));
-  }
-  if (!downloads.length) $('downloadWorkspace').textContent = 'No download tasks yet.';
-  const complete = downloads.filter(row => row.state === 'complete').length;
-  const problems = downloads.filter(row => ['failed','interrupted'].includes(row.state)).length;
-  $('attachmentWorkspaceSummary').textContent = `${attachments.length} files · ${complete} complete · ${problems} problems`;
-}
-
-function selectedFileNames() {
-  return [...$('attachmentWorkspace').querySelectorAll('input[data-kind="attachment"]:checked')].map(input => input.dataset.filename).filter(Boolean);
-}
-
-function addSelectedNames(targetId) {
-  const names = selectedFileNames();
-  if (!names.length) return notice('Select at least one discovered attachment first.');
-  const merged = [...new Set([...list(targetId), ...names])];
-  setList(targetId, merged); summarize(); notice(`Added ${names.length} selected file name(s) to the ${targetId === 'filenameInclude' ? 'include' : 'exclude'} rules.`);
-}
-
-function renderLocalFileResults() {
-  const container = $('localFileResults'); container.replaceChildren();
-  const query = $('localFileSearch').value;
-  const duplicates = localFileAnalysis.duplicateGroups(localFileResults);
-  const matches = localFileAnalysis.search(localFileResults, query);
-  $('localFileSummary').textContent = localFileResults.length ? `${localFileResults.length} files · ${duplicates.length} exact duplicate groups` : 'Opt-in · local only';
-  for (const item of localFileResults) {
-    const classification = item.insights?.classification;
-    const sensitive = item.insights?.sensitive?.counts || {};
-    const sensitiveSummary = Object.entries(sensitive).map(([type, count]) => `${type}: ${count}`).join(', ');
-    const suggestions = item.insights?.structured;
-    const structuredSummary = [
-      ...(suggestions?.identifiers || []).slice(0, 5).map(value => `${value.field}: ${value.value}`),
-      ...(suggestions?.amounts || []).slice(0, 3).map(value => `amount: ${value}`),
-      ...(suggestions?.dates || []).slice(0, 3).map(value => `date: ${value}`)
-    ].join(' · ');
-    container.append(fileRow({
-      id:item.sha256 || item.name, fileName:item.name, kind:'local-file',
-      state:item.sha256 ? 'hashed' : 'hash skipped',
-      meta:`${formatBytes(item.sizeBytes)} · ${item.type || item.extension || 'unknown type'} · ${item.textStatus.replaceAll('-', ' ')}${item.ocr?.confidence != null ? ` · OCR confidence ${Math.round(item.ocr.confidence)}%` : ''}${item.ocrStatus === 'failed' ? ` · OCR failed: ${item.ocrError}` : ''}${classification?.primary && classification.primary !== 'unclassified' ? ` · likely ${classification.primary} (${Math.round(classification.confidence * 100)}%)` : ''}${sensitiveSummary ? ` · possible sensitive patterns: ${sensitiveSummary}` : ''}${structuredSummary ? ` · suggestions: ${structuredSummary}` : ''}`,
-      selectable:false
-    }));
-  }
-  if (duplicates.length) {
-    const heading = document.createElement('strong'); heading.textContent = 'Exact content duplicates'; container.append(heading);
-    for (const group of duplicates) {
-      const p = document.createElement('p'); p.className = 'micro'; p.textContent = `${group.items.map(item => item.name).join(' = ')} · SHA-256 ${group.sha256}`; container.append(p);
+function readConfig() {
+  const intent = selectedIntent();
+  const fileType = $('fFileType').value;
+  const filenameInclude = intent === 'emails' ? [] : schema.parseTerms($('fFilename').value);
+  const filenameExclude = schema.parseTerms($('filenameExclude').value);
+  const customExtensions = schema.parseTerms($('customExtensions').value);
+  const minBytes = megabytes('minMb');
+  const maxBytes = megabytes('maxMb');
+  const hasFileRules = fileType !== 'all' || filenameInclude.length || filenameExclude.length || customExtensions.length || minBytes != null || maxBytes != null;
+  const typeGroups = fileType === 'all' ? ['all'] : [fileType];
+  return schema.normalizeConfig({
+    source: {
+      mode: $('scopeMode').value,
+      gmailQuery: buildQuery(),
+      incremental: $('incremental').checked,
+      pacingMs: Number($('pacingMs').value),
+      maxMatchedThreads: $('maxThreads').value,
+      maxInspectedThreads: $('maxInspected').value
+    },
+    email: {
+      includeTerms: schema.parseTerms($('includeTerms').value),
+      excludeTerms: schema.parseTerms($('excludeTerms').value),
+      includeMode: $('includeMode').value,
+      matchType: $('matchType').value,
+      wholeWord: $('wholeWord').checked,
+      caseSensitive: $('caseSensitive').checked,
+      fields: checkedValues('fields'),
+      threadMode: $('threadMode').value,
+      ruleScope: $('ruleScope').value,
+      // Gmail searches whole conversations, so a date range only trims messages locally in this mode.
+      dateFrom: $('threadMode').value === 'matching-messages' ? $('fAfter').value : '',
+      dateTo: $('threadMode').value === 'matching-messages' ? $('fBefore').value : '',
+      requireMatchingAttachment: intent === 'attachments' && !!hasFileRules
+    },
+    attachments: {
+      action: intent === 'emails' ? 'none' : hasFileRules ? 'matching' : 'all',
+      typeGroups,
+      customExtensions,
+      filenameInclude,
+      filenameExclude,
+      excludeClutter: $('excludeClutter').checked,
+      minBytes,
+      maxBytes
+    },
+    destination: { rootFolder: $('rootFolder').value.trim() || 'InboxFoundry' },
+    output: {
+      formats: checkedValues('formats'),
+      contentMode: $('contentMode').value,
+      includeRawHtml: $('includeRawHtml').checked,
+      includeGmailUrls: $('includeGmailUrls').checked,
+      includeInternalIds: $('includeInternalIds').checked,
+      redactAddresses: $('redactAddresses').checked,
+      folderTemplate: $('folderTemplate').value.trim() || '{index} - {subject}'
     }
-  }
-  if (query.trim()) {
-    const heading = document.createElement('strong'); heading.textContent = `Text search: ${matches.reduce((sum, match) => sum + match.count, 0)} match(es) in ${matches.length} file(s)`; container.append(heading);
-    for (const match of matches) {
-      const sources = (match.sources || []).map(source => `${source.source}: ${source.count}`).join(', ');
-      const p = document.createElement('p'); p.className = 'micro'; p.textContent = `${match.name} · ${match.count} match(es)${sources ? ` · ${sources}` : ''}${match.snippets.length ? ` · ${match.snippets.join(' … ')}` : ''}`; container.append(p);
-    }
-  }
-  if (!localFileResults.length) container.textContent = 'No local files analyzed.';
-  $('exportLocalAnalysis').disabled = !localFileResults.length;
-  $('exportRedactedFiles').disabled = !localFileResults.some(item => item.text);
-  $('clearLocalAnalysis').disabled = !localFileResults.length;
+  });
 }
 
 function validatedConfig() {
   const config = readConfig();
-  if (!config.email.fields.length && config.email.includeTerms.length) throw new Error('Select at least one email field for keyword matching.');
-  if (!config.output.formats.length) throw new Error('Select at least one export format.');
-  if (config.attachments.minBytes != null && config.attachments.maxBytes != null && config.attachments.minBytes > config.attachments.maxBytes) throw new Error('Minimum file size cannot exceed maximum file size.');
-  if (config.email.minMessages != null && config.email.maxMessages != null && config.email.minMessages > config.email.maxMessages) throw new Error('Minimum message count cannot exceed maximum message count.');
-  if (config.email.matchType === 'regex') for (const term of [...config.email.includeTerms, ...config.email.excludeTerms]) if (!filterEngine.safeRegex(term, config.email.caseSensitive ? '' : 'i')) throw new Error(`Unsafe or invalid regular expression: ${term}`);
-  if (config.attachments.matchType === 'regex') for (const term of [...config.attachments.filenameInclude, ...config.attachments.filenameExclude]) if (!filterEngine.safeRegex(term, config.attachments.caseSensitive ? '' : 'i')) throw new Error(`Unsafe or invalid filename regular expression: ${term}`);
+  const { email, attachments } = config;
+  if (!email.fields.length && (email.includeTerms.length || email.excludeTerms.length)) throw new Error('Tick at least one place to look for your terms.');
+  if ($('fAfter').value && $('fBefore').value && $('fAfter').value > $('fBefore').value) throw new Error('The "From date" is after the "To date".');
+  if (attachments.minBytes != null && attachments.maxBytes != null && attachments.minBytes > attachments.maxBytes) throw new Error('The minimum file size is larger than the maximum.');
   return config;
 }
 
-function gmailQuery() {
-  return gmailQueryEngine.build({ raw:$('gmailQuery').value, from:$('queryFrom').value, to:$('queryTo').value,
-    subject:$('querySubject').value, filename:$('queryFilename').value, after:$('queryAfter').value, before:$('queryBefore').value,
-    label:$('queryLabel').value, category:$('queryCategory').value, largerMb:$('queryLarger').value, smallerMb:$('querySmaller').value,
-    hasAttachment:$('queryAttachment').checked, status:$('queryStatus').value, inAnywhere:$('queryAnywhere').checked });
-}
-
-async function refresh() {
-  const r = await send('GET_STATUS'); if (!r) return;
-  $('status').textContent = r.status || 'Idle'; $('jobState').textContent = r.jobStatus || (r.running ? 'Running' : 'Idle');
-  $('inspected').textContent = r.scanned || 0; $('matched').textContent = r.matched || 0; $('rejected').textContent = r.skipped || 0; $('messages').textContent = r.messages || 0; $('downloads').textContent = r.attachments || 0; $('downloadsComplete').textContent = r.downloadsComplete || 0;
-  $('rate').textContent = r.running && r.elapsedSeconds > 0 ? `${r.ratePerMinute.toFixed(1)} threads/min · ${Math.round(r.elapsedSeconds)}s elapsed` : '';
-  const max = r.config?.source?.maxMatchedThreads || 250; $('progressBar').style.width = `${Math.min(100, ((r.matched || 0) / max) * 100)}%`;
-  $('start').disabled = !!r.running || !privacyAcknowledged; $('stop').disabled = !r.running; $('reset').disabled = !!r.running;
-  $('resume').disabled = !!r.running || !['stopped','interrupted','failed'].includes(r.jobStatus);
-  if (!initialized && r.config) { writeConfig(r.config); initialized = true; }
-  if (r.jobId !== attachmentWorkspaceJobId) await loadAttachmentWorkspace(r.jobId);
-  if (r.justStopped) $('previewResult').innerHTML = `<h2>Partial export ready</h2><p>${r.matched || 0} matched threads are safely checkpointed.</p>`;
-}
-
-async function db(type, extra = {}) { const r = await chrome.runtime.sendMessage({ type, ...extra }); if (!r?.ok) throw new Error(r?.error || 'Storage action failed'); return r.result; }
-async function loadPresets() { const rows = await db('DB_LIST_PRESETS'); $('presets').innerHTML = '<option value="">Choose a preset…</option>' + rows.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`).join(''); }
-async function loadJobs() { const rows = await db('DB_LIST_JOBS'); rows.sort((a,b) => String(b.updatedAt).localeCompare(String(a.updatedAt))); $('jobs').innerHTML = '<option value="">Choose a retained batch…</option>' + rows.map(job => `<option value="${escapeHtml(job.id)}">${escapeHtml(job.name)} · ${escapeHtml(job.status)}</option>`).join(''); }
-async function loadStorageUsage() { const estimate = await db('DB_STORAGE_ESTIMATE'); $('storageUsage').textContent = estimate?.usage == null ? 'Storage estimate unavailable.' : `${(estimate.usage / 1048576).toFixed(2)} MB used by this extension origin.`; }
-
-$('start').onclick = async () => { try { $('status').textContent = 'Starting…'; await send('START_EXPORT', { config: validatedConfig() }); await loadJobs(); await refresh(); } catch (error) { notice(error.message); } };
-$('resume').onclick = async () => { $('status').textContent = 'Resuming…'; await send('RESUME_EXPORT'); await refresh(); };
-$('stop').onclick = async () => { await send('STOP_EXPORT'); await refresh(); };
-$('export').onclick = async () => { await send('DOWNLOAD_EXPORTS', { formats: checked('formats') }); };
-$('retryDownloads').onclick = async () => { const status = await send('GET_STATUS'); if (!status?.jobId) return notice('No job is open.'); const r = await chrome.runtime.sendMessage({ type:'RETRY_INTERRUPTED_DOWNLOADS', jobId:status.jobId }); if (!r?.ok) return notice(r?.error || 'Retry failed.'); notice(r.resumed ? `Resumed ${r.resumed} interrupted download(s).` : 'No interrupted Chrome download is currently resumable.'); await loadAttachmentWorkspace(status.jobId); await refresh(); };
-$('preview').onclick = async () => { try { const r = await send('PREVIEW_CURRENT_THREAD', { config: validatedConfig() }); if (!r) return; const files = (r.attachments || []).map(item => `<li>${escapeHtml(item.fileName)} — ${item.matched ? 'included' : `excluded (${escapeHtml((item.reasons || []).join(', '))})`}</li>`).join(''); $('previewResult').hidden = false; $('previewResult').innerHTML = `<h2>${r.matched ? 'This thread matches' : 'This thread does not match'}</h2><p>${escapeHtml(r.subject || '(No subject)')}</p><p>${r.messageCount} messages · ${r.attachmentCount} attachments · ${r.matchingAttachmentCount} matching files</p><p>Reason: ${escapeHtml((r.reasons || []).join(', '))}</p>${files ? `<ul>${files}</ul>` : ''}`; } catch (error) { notice(error.message); } };
-$('dryRun').onclick = async () => { try { $('dryRun').disabled = true; const limit = Math.min(10, Math.max(1, Number($('sampleLimit').value) || 3)); const r = await send('DRY_RUN_SAMPLE', { config: validatedConfig(), limit }); if (!r) return; const rows = (r.results || []).map(item => `<li><strong>${escapeHtml(item.subject || `Item ${item.ordinal}`)}</strong> — ${item.error ? `error: ${escapeHtml(item.error)}` : item.matched ? 'matches' : `rejected (${escapeHtml((item.reasons || []).join(', '))})`} · ${item.messageCount || 0} message(s) · ${item.attachmentCount || 0} attachment(s)</li>`).join(''); $('previewResult').hidden = false; $('previewResult').innerHTML = `<h2>Dry run — nothing saved or downloaded</h2><p>${r.inspected} inspected · ${r.matched} matched · ${r.rejected} rejected · ${r.errors} errors</p><ol>${rows}</ol>`; } catch (error) { notice(error.message); } finally { $('dryRun').disabled = false; } };
-$('estimate').onclick = async () => { const r = await send('GET_EXPORT_ESTIMATE'); if (!r) return; $('previewResult').hidden = false; $('previewResult').innerHTML = `<h2>Saved-output estimate</h2><p>${r.threads} threads · ${r.messages} messages · ${r.attachments} requested files</p><p>Canonical JSON is approximately ${(r.bytes / 1048576).toFixed(2)} MB before pretty-printing.</p>`; };
-$('openSearch').onclick = async () => { const query = gmailQuery(); if (!query) return notice('Enter at least one Gmail search condition.'); await send('OPEN_GMAIL_QUERY', { query }); };
-$('reset').onclick = async () => { if (!confirm('Delete the current InboxFoundry job and locally stored email records? Downloaded files remain on disk.')) return; await send('RESET_EXPORT'); await refresh(); };
-$('savePreset').onclick = async () => { const name = $('presetName').value.trim(); if (!name) return notice('Enter a preset name.'); const presets = await db('DB_LIST_PRESETS'); if (presets.length >= 5) return notice('Free supports up to 5 saved presets.'); await db('DB_PUT_PRESET', { preset: { id: `preset-${Date.now()}`, name, config: readConfig(), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() } }); await loadPresets(); };
-$('loadPreset').onclick = async () => { const rows = await db('DB_LIST_PRESETS'); const p = rows.find(x => x.id === $('presets').value); if (p) writeConfig(p.config); };
-$('deletePreset').onclick = async () => { if (!$('presets').value) return; await db('DB_DELETE_PRESET', { presetId: $('presets').value }); await loadPresets(); };
-$('renamePreset').onclick = async () => { const id = $('presets').value; const name = $('presetName').value.trim(); if (!id || !name) return notice('Choose a preset and enter its new name.'); const rows = await db('DB_LIST_PRESETS'); const preset = rows.find(item => item.id === id); if (!preset) return; await db('DB_PUT_PRESET', { preset: { ...preset, name, updatedAt: new Date().toISOString() } }); await loadPresets(); };
-$('duplicatePreset').onclick = async () => { const id = $('presets').value; const rows = await db('DB_LIST_PRESETS'); if (rows.length >= 5) return notice('Free supports up to 5 saved presets.'); const preset = rows.find(item => item.id === id); if (!preset) return notice('Choose a preset to duplicate.'); await db('DB_PUT_PRESET', { preset: { ...preset, id: `preset-${Date.now()}`, name: `${preset.name} copy`, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() } }); await loadPresets(); };
-$('exportPresets').onclick = async () => { const rows = await db('DB_LIST_PRESETS'); const blob = new Blob([JSON.stringify({ format:'InboxFoundryPresets', version:1, presets:rows }, null, 2)], { type:'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'inboxfoundry-presets.json'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 10000); };
-$('importPresets').onchange = async () => { try { const file = $('importPresets').files?.[0]; if (!file) return; const parsed = JSON.parse(await file.text()); if (parsed.format !== 'InboxFoundryPresets' || parsed.version !== 1 || !Array.isArray(parsed.presets)) throw new Error('This is not a supported InboxFoundry preset file.'); const existing = await db('DB_LIST_PRESETS'); const capacity = Math.max(0, 5 - existing.length); for (const preset of parsed.presets.slice(0, capacity)) await db('DB_PUT_PRESET', { preset: { id:`preset-${Date.now()}-${Math.random().toString(36).slice(2,7)}`, name:String(preset.name || 'Imported preset').slice(0,80), config:schema.normalizeConfig(preset.config), createdAt:new Date().toISOString(), updatedAt:new Date().toISOString() } }); await loadPresets(); notice(`Imported ${Math.min(capacity, parsed.presets.length)} preset(s).`); } catch (error) { notice(error.message); } finally { $('importPresets').value = ''; } };
-$('loadStarter').onclick = () => { const preset = STARTERS[$('starterPreset').value]; if (!preset) return notice('Choose a starter workflow first.'); writeConfig(schema.normalizeConfig(preset)); };
-$('loadJob').onclick = async () => { if (!$('jobs').value) return notice('Choose a retained batch first.'); const r = await send('LOAD_JOB', { jobId: $('jobs').value }); if (r) { initialized = false; await refresh(); } };
-$('refreshAttachmentWorkspace').onclick = () => loadAttachmentWorkspace().catch(error => notice(error.message));
-$('selectInterruptedDownloads').onclick = () => { for (const input of $('downloadWorkspace').querySelectorAll('input[data-kind="download"]')) input.checked = input.closest('.file-row')?.querySelector('.state')?.textContent === 'interrupted'; };
-$('useSelectedIncludes').onclick = () => addSelectedNames('filenameInclude');
-$('useSelectedExcludes').onclick = () => addSelectedNames('filenameExclude');
-$('retrySelectedDownloads').onclick = async () => { const taskIds = [...$('downloadWorkspace').querySelectorAll('input[data-kind="download"]:checked')].map(input => input.dataset.id); if (!taskIds.length) return notice('Select at least one interrupted download task first.'); if (!attachmentWorkspaceJobId) return notice('No saved batch is open.'); const r = await chrome.runtime.sendMessage({ type:'RETRY_INTERRUPTED_DOWNLOADS', jobId:attachmentWorkspaceJobId, taskIds }); if (!r?.ok) return notice(r?.error || 'Retry failed.'); notice(`Resumed ${r.resumed} of ${r.requested} selected resumable task(s)${r.errors?.length ? `; ${r.errors.length} failed to resume` : ''}.`); await loadAttachmentWorkspace(); };
-$('analyzeLocalFiles').onclick = async () => {
-  try {
-    const files = $('localFiles').files;
-    if (!files?.length) return notice('Choose one or more local files first.');
-    localAnalysisController = new AbortController();
-    $('analyzeLocalFiles').disabled = true;
-    $('cancelLocalAnalysis').disabled = false;
-    $('localFileSummary').textContent = 'Analyzing locally…';
-    const analyzed = await localFileAnalysis.analyzeFiles(files, {
-      signal:localAnalysisController.signal,
-      ocr:$('runOcr').checked,
-      ocrEngine,
-      ocrOptions:{ maxPagesPerPdf:Math.min(20, Math.max(1, Number($('ocrPages').value) || 10)) },
-      onProgress:value => {
-        const percent = Math.min(100, Math.round((value.progress ?? (value.totalBytes ? value.processedBytes / value.totalBytes : 0)) * 100));
-        const activity = value.phase?.startsWith('ocr') ? `${value.status || 'recognizing text'} ${percent}%` : `hashing ${percent}%`;
-        $('localFileSummary').textContent = `File ${value.fileIndex}/${value.fileCount} · ${activity}`;
-      }
-    });
-    localFileResults = analyzed;
-    renderLocalFileResults();
-    const ocrCount = analyzed.filter(item => item.ocrStatus === 'extracted').length;
-    notice(`Analyzed ${localFileResults.length} file(s) locally${ocrCount ? `; OCR extracted text from ${ocrCount}` : ''}. File contents were not stored or uploaded.`);
-  } catch (error) {
-    notice(error.message === 'analysis-cancelled' ? 'Local file analysis cancelled; previous inspector results were preserved.' : error.message);
-    renderLocalFileResults();
-  } finally {
-    localAnalysisController = null;
-    $('analyzeLocalFiles').disabled = false;
-    $('cancelLocalAnalysis').disabled = true;
+function readForm() {
+  const form = { intent: selectedIntent(), fields: checkedValues('fields') };
+  for (const id of FORM_FIELD_IDS) {
+    const element = $(id);
+    form[id] = element.type === 'checkbox' ? element.checked : element.value;
   }
-};
-$('cancelLocalAnalysis').onclick = () => { localAnalysisController?.abort(); $('cancelLocalAnalysis').disabled = true; $('localFileSummary').textContent = 'Cancelling…'; };
-$('localFileSearch').oninput = renderLocalFileResults;
-$('exportLocalAnalysis').onclick = () => { const report = localFileAnalysis.report(localFileResults, $('localFileSearch').value, { includeInsights:$('includeLocalInsights').checked }); const blob = new Blob([JSON.stringify(report, null, 2)], { type:'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `inboxfoundry-local-file-analysis-${new Date().toISOString().replace(/[:.]/g, '-')}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 10000); };
-$('exportRedactedFiles').onclick = async () => { try { $('exportRedactedFiles').disabled = true; const { entries, manifest } = await localFileAnalysis.buildRedactionEntries(localFileResults, checked('redactionTypes')); const blob = new Blob([exportEngine.zipArchive(entries)], { type:'application/zip' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `inboxfoundry-redacted-text-${new Date().toISOString().replace(/[:.]/g, '-')}.zip`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 10000); notice(`Created ${manifest.files.length} redacted text copy/copies with hashes and a manifest. Review them before sharing.`); } catch (error) { notice(error.message); } finally { renderLocalFileResults(); } };
-$('clearLocalAnalysis').onclick = () => { localFileResults = []; $('localFiles').value = ''; $('localFileSearch').value = ''; renderLocalFileResults(); notice('Local inspector memory cleared.'); };
-$('diagnostics').onclick = async () => { await send('DOWNLOAD_DIAGNOSTICS'); };
-$('encryptedExport').onclick = async () => { const passphrase = $('encryptionPassphrase').value; if (passphrase.length < 10) return notice('Use an encryption passphrase of at least 10 characters. It is never stored.'); const r = await send('DOWNLOAD_ENCRYPTED', { passphrase }); if (r) { $('encryptionPassphrase').value = ''; notice('Encrypted archive created. Keep the passphrase somewhere safe; InboxFoundry cannot recover it.'); } };
-$('decryptArchive').onchange = async () => { try { const file = $('decryptArchive').files?.[0]; const passphrase = $('encryptionPassphrase').value; if (!file) return; if (passphrase.length < 10) throw new Error('Enter the archive passphrase above first.'); const plaintext = await exportEngine.decryptText(await file.text(), passphrase); JSON.parse(plaintext); const blob = new Blob([plaintext], { type:'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = file.name.replace(/\.ifenc$/i, '') + '.json'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 10000); $('encryptionPassphrase').value = ''; notice('Archive decrypted locally.'); } catch (error) { notice('Could not decrypt the archive. Check the passphrase and file.'); } finally { $('decryptArchive').value = ''; } };
-$('clearJobs').onclick = async () => { if (!confirm('Delete every locally retained InboxFoundry job and record? Downloaded files remain on disk.')) return; try { await db('DB_CLEAR_JOBS'); await send('CLEAR_MEMORY_STATE'); await loadJobs(); await loadStorageUsage(); notice('All retained jobs were deleted.'); } catch (error) { notice(error.message); } };
-$('clearPresets').onclick = async () => { if (!confirm('Delete every saved filter preset?')) return; await db('DB_CLEAR_PRESETS'); await loadPresets(); notice('All saved presets were deleted.'); };
-$('acknowledge').onclick = async () => { privacyAcknowledged = true; await chrome.storage.local.set({ inboxFoundryPrivacyAcknowledgedV1: true }); $('disclosure').hidden = true; await refresh(); };
-document.addEventListener('input', summarize);
-$('fileTypes').addEventListener('change', event => { if (event.target.value === 'all' && event.target.checked) for (const input of $('fileTypes').querySelectorAll('input:not([value=all])')) input.checked = false; else if (event.target.value !== 'all' && event.target.checked) $('fileTypes').querySelector('[value=all]').checked = false; if (!checked('fileTypes').length) $('fileTypes').querySelector('[value=all]').checked = true; });
-$('version').textContent = `v${chrome.runtime.getManifest().version}`;
-writeConfig(schema.DEFAULT_CONFIG);
-renderLocalFileResults();
-chrome.storage.local.get('inboxFoundryPrivacyAcknowledgedV1').then(value => { privacyAcknowledged = value.inboxFoundryPrivacyAcknowledgedV1 === true; $('disclosure').hidden = privacyAcknowledged; refresh(); });
-Promise.all([loadPresets(), loadJobs(), loadStorageUsage()]).catch(error => notice(error.message));
-const timer = setInterval(refresh, 1200); addEventListener('unload', () => clearInterval(timer));
+  return form;
+}
+
+function writeForm(form) {
+  if (!form) return;
+  for (const id of FORM_FIELD_IDS) {
+    const element = $(id);
+    if (form[id] === undefined) continue;
+    if (element.type === 'checkbox') element.checked = !!form[id];
+    else element.value = form[id];
+  }
+  const intent = document.querySelector(`input[name="intent"][value="${form.intent}"]`);
+  if (intent) intent.checked = true;
+  if (Array.isArray(form.fields)) {
+    for (const input of $('fields').querySelectorAll('input')) input.checked = form.fields.includes(input.value);
+  }
+}
+
+function refreshFormHints() {
+  const query = buildQuery();
+  const scope = $('scopeMode').value;
+  $('searchFields').hidden = !usesSearchFields();
+  $('fileFields').hidden = selectedIntent() === 'emails';
+  if (!usesSearchFields()) {
+    $('queryLabelText').textContent = 'Will scan';
+    $('queryPreview').textContent = scope === 'selected' ? 'the conversations you ticked in Gmail' : 'the conversation you have open';
+  } else if (query) {
+    $('queryLabelText').textContent = 'Gmail search';
+    $('queryPreview').textContent = query;
+  } else {
+    $('queryLabelText').textContent = 'Will scan';
+    $('queryPreview').textContent = 'whatever Gmail is showing now';
+  }
+  chrome.storage.local.set({ [FORM_KEY]: readForm() }).catch(() => {});
+}
+
+function applyIntentDefaults() {
+  if (formatsTouched) return;
+  const defaults = selectedIntent() === 'attachments' ? ['manifest'] : ['archive'];
+  for (const input of $('formats').querySelectorAll('input')) input.checked = defaults.includes(input.value);
+}
+
+// ---- Job display ----
+
+function formatBytes(value) {
+  const size = Number(value);
+  if (value == null || !Number.isFinite(size)) return 'size unknown';
+  if (size < 1024) return `${size} B`;
+  if (size < 1048576) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1048576).toFixed(1)} MB`;
+}
+
+function makeRow({ checked, onToggle, name, meta, badge, problem }) {
+  const row = document.createElement('label');
+  row.className = 'file-row';
+  if (onToggle) {
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = !!checked;
+    input.addEventListener('change', guarded(() => onToggle(input.checked)));
+    row.append(input);
+  } else {
+    row.append(document.createElement('span'));
+  }
+  const main = document.createElement('span');
+  const title = document.createElement('span');
+  title.className = 'file-name';
+  title.textContent = name || '(No name)';
+  const detail = document.createElement('span');
+  detail.className = 'file-meta';
+  detail.textContent = meta || '';
+  main.append(title, detail);
+  const state = document.createElement('span');
+  state.className = `state${problem ? ' problem' : ''}`;
+  state.textContent = badge || '';
+  row.append(main, state);
+  return row;
+}
+
+function threadRow(thread) {
+  const when = thread.date ? thread.date.slice(0, 10) : 'date unknown';
+  const notes = [
+    `${thread.messageCount || 0} message(s)`,
+    `${thread.attachmentCount || 0} file(s)`,
+    when,
+    thread.wasUnread ? 'was unread' : '',
+    (thread.warnings || []).length ? 'may be incomplete' : ''
+  ].filter(Boolean).join(' · ');
+  return makeRow({
+    checked: !thread.excluded,
+    name: thread.subject || '(No subject)',
+    meta: `${thread.from || ''} · ${notes}`,
+    badge: (thread.warnings || []).length ? 'check' : '',
+    problem: (thread.warnings || []).length > 0,
+    onToggle: value => store.patchThread(thread.id, { excluded: !value })
+  });
+}
+
+function fileRow(file) {
+  const canChoose = ['discovered', 'pending'].includes(file.state);
+  const problem = ['failed', 'interrupted', 'erased', 'unavailable'].includes(file.state);
+  let badge = FILE_STATE_LABELS[file.state] || file.state;
+  if (file.driveLink) badge = 'Drive link';
+  const why = (file.reasons || []).filter(reason => reason !== 'attachment-rules').join(', ');
+  const meta = [formatBytes(file.sizeBytes), file.subject, why && `rule: ${why}`, file.error].filter(Boolean).join(' · ');
+  return makeRow({
+    checked: file.selected,
+    name: file.fileName,
+    meta,
+    badge,
+    problem,
+    onToggle: canChoose ? value => store.patchAttachment(file.id, { selected: value }) : null
+  });
+}
+
+async function appendThreads() {
+  const rows = await store.matchedThreadPage(currentJob.id, threadCursor, store.PAGE_SIZE);
+  for (const thread of rows) $('threadList').append(threadRow(thread));
+  if (rows.length) threadCursor = rows.at(-1).seq;
+  $('threadsMore').hidden = rows.length < store.PAGE_SIZE;
+}
+
+async function appendFiles() {
+  const rows = await store.attachmentPage(currentJob.id, fileCursor, store.PAGE_SIZE);
+  for (const file of rows) $('fileList').append(fileRow(file));
+  if (rows.length) fileCursor = rows.at(-1).seq;
+  $('filesMore').hidden = rows.length < store.PAGE_SIZE;
+}
+
+async function renderFailed() {
+  $('failedList').replaceChildren();
+  let count = 0;
+  for await (const thread of store.iterateThreads(currentJob.id)) {
+    if (thread.outcome !== 'failed') continue;
+    count++;
+    if (count <= 50) $('failedList').append(makeRow({ name: `Conversation ${thread.seq + 1}`, meta: thread.error, badge: `tried ${thread.attempts || 1}x`, problem: true }));
+  }
+  $('failedPanel').hidden = !count;
+  $('failedCount').textContent = String(count);
+}
+
+async function renderReviewLists() {
+  threadCursor = -1;
+  fileCursor = -1;
+  $('threadList').replaceChildren();
+  $('fileList').replaceChildren();
+  await Promise.all([appendThreads(), appendFiles(), renderFailed()]);
+  $('threadsCount').textContent = String(currentJob.counters.matched);
+}
+
+function renderWarnings(job, counts) {
+  const items = [];
+  for (const reason of exporter.partialReasons(job)) {
+    if (reason !== 'stopped' || job.status === 'stopped') items.push(exporter.REASON_TEXT[reason] || reason);
+  }
+  if (job.counters.unread > 0) items.push(`${job.counters.unread} conversation(s) were unread and are now marked as read in Gmail.`);
+  if (counts?.unavailable) items.push(`${counts.unavailable} file(s) can't be downloaded here, such as Google Drive links. They are listed in the file list.`);
+  if (job.lastError) items.push(job.lastError);
+  $('warnings').replaceChildren(...items.map(text => {
+    const item = document.createElement('li');
+    item.textContent = text;
+    return item;
+  }));
+  $('warnings').hidden = !items.length;
+}
+
+async function renderJob() {
+  const job = currentJob;
+  const active = jobMachine.isActive(job);
+  const counters = job?.counters;
+  $('jobState').textContent = job ? STATE_LABELS[job.status] || job.status : 'Idle';
+  $('inspected').textContent = counters?.inspected ?? 0;
+  $('matched').textContent = counters?.matched ?? 0;
+  $('rejected').textContent = (counters?.rejected ?? 0) + (counters?.unchanged ?? 0);
+  $('failedThreads').textContent = counters?.failed ?? 0;
+  $('start').disabled = !consented || active || exporting;
+  $('stop').disabled = !active;
+  const scanDone = !!job?.scanFinishedAt && job.phase === 'download';
+  $('resume').disabled = !job || active || exporting || scanDone || !jobMachine.isResumable(job);
+  $('save').disabled = !job || active || exporting || job.status === 'draft';
+  $('reviewSection').hidden = !job;
+  if (!job) {
+    $('warnings').hidden = true;
+    return;
+  }
+  const counts = await store.attachmentCounts(job.id);
+  $('filesDone').textContent = counts.complete;
+  const problems = counts.failed + counts.interrupted;
+  $('filesProblem').textContent = problems;
+  $('retryFailed').disabled = active || exporting || !problems;
+  $('deleteBatch').disabled = active || exporting;
+  const totalFiles = Object.values(counts).reduce((sum, value) => sum + value, 0);
+  $('filesCount').textContent = String(totalFiles);
+  $('reviewTitle').textContent = job.name;
+  $('reviewSummary').textContent = `${counters.matched} conversation(s) matched from ${counters.inspected} opened. ${counts.discovered + counts.pending} file(s) waiting, ${counts.complete} saved.${job.savedAt ? ` Last saved ${new Date(job.savedAt).toLocaleString()}.` : ''}`;
+  renderWarnings(job, counts);
+  // Rebuild the lists only when the job's shape changes, so ticking a box is never undone by the refresh.
+  const key = active ? `${job.id}|active` : `${job.id}|${job.status}|${counters.matched}|${counters.failed}|${counts.complete}|${problems}`;
+  if (key !== shownJobKey && !active) {
+    shownJobKey = key;
+    await renderReviewLists();
+  }
+}
+
+async function setCurrentJob(jobId) {
+  currentJob = jobId ? await store.getJob(jobId) : null;
+  shownJobKey = '';
+  await chrome.storage.local.set({ [CURRENT_JOB_KEY]: currentJob?.id || null });
+}
+
+async function checkActiveJob() {
+  const job = currentJob;
+  if (!jobMachine.isActive(job)) return;
+  let status = null;
+  try {
+    if (job.ownerTabId != null) status = await chrome.tabs.sendMessage(job.ownerTabId, { type: 'GET_STATUS' });
+  } catch {
+    status = null;
+  }
+  if (status?.ok && status.running && status.jobId === job.id) {
+    missedPings = 0;
+    lastStage = status.stage;
+    if (status.hidden) lastStage += ' (this Gmail tab is in the background, so it may run slowly)';
+    return;
+  }
+  // Allow for a moment between the job row being written and the script reporting it.
+  missedPings++;
+  if (missedPings >= 4) {
+    missedPings = 0;
+    await store.patchJob(job.id, { status: 'interrupted', leaseExpiresAt: null, lastError: 'The Gmail tab was reloaded or closed. Everything captured so far is kept. Resume to continue.' });
+    currentJob = await store.getJob(job.id);
+  }
+}
+
+async function tick() {
+  if (currentJob) {
+    await checkActiveJob();
+    currentJob = await store.getJob(currentJob.id);
+    if (!currentJob) shownJobKey = '';
+  }
+  if (currentJob) {
+    const active = jobMachine.isActive(currentJob);
+    if (active) {
+      const { inspected = 0 } = currentJob.counters;
+      const started = Date.parse(currentJob.startedAt || currentJob.createdAt);
+      const minutes = Math.max(1 / 60, (Date.now() - started) / 60000);
+      $('rate').textContent = currentJob.phase === 'scan' ? `${(inspected / minutes).toFixed(1)} conversations a minute` : '';
+    } else {
+      $('rate').textContent = '';
+    }
+    if (!exporting) {
+      $('status').textContent = active ? lastStage || 'Working…' : statusSentence(currentJob);
+    }
+    if (!active && currentJob.pendingExport && !exporting) await continueExport();
+  } else if (!exporting) {
+    const tab = await activeGmailTab();
+    $('status').textContent = tab ? 'Ready' : 'Open Gmail in this window to begin';
+    $('rate').textContent = '';
+  }
+  await renderJob();
+}
+
+function statusSentence(job) {
+  switch (job.status) {
+    case 'ready': return job.savedAt ? 'Saved. You can save again or start a new search.' : 'Scan finished. Review the results, then save.';
+    case 'stopped': return job.stopReason === 'limit' ? 'Stopped at your safety limit. Raise it and resume to continue.' : 'Stopped safely. Everything captured so far is kept.';
+    case 'interrupted': return 'Interrupted. Everything captured so far is kept.';
+    case 'failed': return 'This job needs attention.';
+    default: return STATE_LABELS[job.status] || job.status;
+  }
+}
+
+// ---- Scan actions ----
+
+async function confirmLargeScan(tabId, config) {
+  if (config.source.mode !== 'current-view' || config.source.gmailQuery) return true;
+  const view = await command('VIEW_INFO', {}, tabId);
+  if (!view.total || view.total < LARGE_SCAN_WARNING) return true;
+  const minutes = Math.ceil((view.total * SECONDS_PER_THREAD) / 60);
+  return confirm(`Gmail shows about ${view.total} conversations here. InboxFoundry will open each one (marking them as read), which could take ${minutes} minutes or more. Continue?`);
+}
+
+async function startScan() {
+  notice('');
+  const config = validatedConfig();
+  const tab = await requireGmailTab();
+  if (!await confirmLargeScan(tab.id, config)) return;
+  const response = await command('START_SCAN', { config }, tab.id);
+  lastStage = 'Starting…';
+  missedPings = 0;
+  $('previewResult').hidden = true;
+  await setCurrentJob(response.jobId);
+  await loadBatches();
+  await tick();
+}
+
+async function resumeScan() {
+  notice('');
+  const overrides = { maxMatchedThreads: $('maxThreads').value, maxInspectedThreads: $('maxInspected').value };
+  if (currentJob.stopReason === 'limit' && Number(overrides.maxMatchedThreads) <= currentJob.config.source.maxMatchedThreads && currentJob.partialReasons.includes('limit-matched')) {
+    throw new Error('This batch stopped at its limit. Raise "Stop after matching" under More options, then resume.');
+  }
+  if (currentJob.stopReason === 'limit' && Number(overrides.maxInspectedThreads) <= currentJob.config.source.maxInspectedThreads && currentJob.partialReasons.includes('limit-inspected')) {
+    throw new Error('This batch stopped at its limit. Raise "Stop after opening" under More options, then resume.');
+  }
+  const tab = await requireGmailTab();
+  await command('RESUME_SCAN', { jobId: currentJob.id, overrides }, tab.id);
+  lastStage = 'Resuming…';
+  missedPings = 0;
+  await tick();
+}
+
+async function stopJob() {
+  if (currentJob?.ownerTabId == null) return;
+  await command('STOP', {}, currentJob.ownerTabId);
+  lastStage = 'Stopping after the current item…';
+}
+
+async function previewThread() {
+  const result = await command('PREVIEW_THREAD', { config: validatedConfig() });
+  const box = $('previewResult');
+  const heading = document.createElement('h3');
+  heading.textContent = result.matched ? 'This conversation matches' : 'This conversation does not match';
+  const summary = document.createElement('p');
+  summary.className = 'micro';
+  summary.textContent = `${result.subject || '(No subject)'} · ${result.messageCount} message(s) · ${result.reasons.join(', ')}`;
+  const list = document.createElement('ul');
+  for (const file of result.attachments) {
+    const item = document.createElement('li');
+    item.textContent = `${file.fileName}: ${file.matched ? 'included' : `left out (${file.reasons.join(', ')})`}`;
+    list.append(item);
+  }
+  box.replaceChildren(heading, summary, list);
+  box.hidden = false;
+}
+
+// ---- Save ----
+
+function saveBlob(job, file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file.blob);
+    const finish = (callback, value) => {
+      chrome.downloads.onChanged.removeListener(watch);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      callback(value);
+    };
+    let downloadId = null;
+    const watch = delta => {
+      if (delta.id !== downloadId) return;
+      if (delta.state?.current === 'complete') finish(resolve, file.name);
+      if (delta.state?.current === 'interrupted') finish(reject, new Error(`Could not save ${file.name}: ${delta.error?.current || 'the download was interrupted'}.`));
+    };
+    chrome.downloads.onChanged.addListener(watch);
+    chrome.downloads.download({ url, filename: exporter.downloadPathFor(job, file.name), conflictAction: 'uniquify', saveAs: false }, id => {
+      if (chrome.runtime.lastError || !id) finish(reject, new Error(chrome.runtime.lastError?.message || `Could not save ${file.name}.`));
+      else downloadId = id;
+    });
+  });
+}
+
+async function refreshDownloadStates(jobId) {
+  for await (const file of store.iterateAttachments(jobId)) {
+    if (!Number.isInteger(file.downloadId)) continue;
+    const [item] = await chrome.downloads.search({ id: file.downloadId });
+    if (!item) {
+      if (file.state === 'in_progress') await store.patchAttachment(file.id, { state: 'interrupted', error: 'Chrome no longer lists this download.' });
+      continue;
+    }
+    await store.patchAttachment(file.id, { state: item.state, finalPath: item.filename || file.finalPath, error: item.error || null });
+  }
+}
+
+async function recordExportedMail(job) {
+  const scope = schema.ledgerScope(job);
+  const savedAt = new Date().toISOString();
+  let afterSeq = -1;
+  for (;;) {
+    const rows = await store.matchedThreadPage(job.id, afterSeq, 500);
+    if (!rows.length) return;
+    const entries = [];
+    for (const thread of rows) {
+      if (thread.excluded) continue;
+      const entry = { scope, lastMessageId: thread.lastMessageId || null, messageCount: thread.messageCount, savedAt };
+      entries.push({ ...entry, id: `${scope}|${thread.threadKey}`, threadKey: thread.threadKey });
+      if (thread.permId && thread.permId !== thread.threadKey) entries.push({ ...entry, id: `${scope}|${thread.permId}`, threadKey: thread.permId });
+    }
+    await store.putLedgerEntries(entries);
+    afterSeq = rows.at(-1).seq;
+  }
+}
+
+async function runExports(job, formats, passphrase) {
+  exporting = true;
+  try {
+    $('status').textContent = 'Preparing your files…';
+    await renderJob();
+    await refreshDownloadStates(job.id);
+    const fresh = await store.getJob(job.id);
+    const { files, isPartial } = await exporter.buildFiles(fresh, formats, {
+      store,
+      version: chrome.runtime.getManifest().version,
+      onProgress: text => { $('status').textContent = text; }
+    });
+    const output = passphrase ? await exporter.encryptFiles(files, passphrase) : files;
+    for (const file of output) {
+      $('status').textContent = `Saving ${file.name}…`;
+      await saveBlob(fresh, file);
+    }
+    await recordExportedMail(fresh);
+    await store.patchJob(job.id, { savedAt: new Date().toISOString(), pendingExport: null });
+    const where = exporter.downloadPathFor(fresh, '').replace(/\/[^/]*$/, '');
+    const counts = await store.attachmentCounts(job.id);
+    const parts = [`Saved to Downloads/${where}.`];
+    if (isPartial) parts.push('This batch is marked partial; the reasons are listed above and in the files.');
+    if (counts.failed + counts.interrupted) parts.push(`${counts.failed + counts.interrupted} file(s) failed. Use "Retry failed files".`);
+    if (counts.pending) parts.push(`${counts.pending} file(s) are still waiting. Press "Save selected" with Gmail open to continue.`);
+    notice(parts.join(' '), isPartial || counts.failed + counts.interrupted + counts.pending ? 'error' : 'info');
+  } finally {
+    exporting = false;
+    currentJob = await store.getJob(job.id);
+  }
+}
+
+async function continueExport() {
+  const job = currentJob;
+  const formats = job.pendingExport.formats || [];
+  if (job.pendingExport.encrypted && !pendingPassphrase) {
+    await store.patchJob(job.id, { pendingExport: null });
+    notice('Attachments finished. Enter your passphrase again and press Save to write the encrypted export.');
+    return;
+  }
+  const passphrase = pendingPassphrase;
+  pendingPassphrase = '';
+  if (!formats.length) {
+    await recordExportedMail(job);
+    await store.patchJob(job.id, { savedAt: new Date().toISOString(), pendingExport: null });
+    const counts = await store.attachmentCounts(job.id);
+    const problems = counts.failed + counts.interrupted + counts.pending;
+    notice(problems ? `${counts.complete} file(s) saved, ${problems} not saved. Use "Retry failed files" or "Save selected".` : `${counts.complete} file(s) saved to Downloads.`, problems ? 'error' : 'info');
+    return;
+  }
+  await runExports(job, formats, passphrase);
+  $('encryptionPassphrase').value = '';
+}
+
+async function save() {
+  notice('');
+  const job = currentJob;
+  const formats = checkedValues('formats');
+  const encrypted = $('encryptExport').checked;
+  const passphrase = encrypted ? $('encryptionPassphrase').value : '';
+  if (encrypted && passphrase.length < 10) throw new Error('Use an encryption passphrase of at least 10 characters.');
+  if (encrypted && !formats.length) throw new Error('Choose at least one format to encrypt.');
+
+  const excluded = new Set();
+  for await (const thread of store.iterateThreads(job.id)) if (thread.excluded) excluded.add(thread.id);
+  await store.updateAttachments(job.id, file => {
+    const wanted = file.selected && !excluded.has(file.threadId);
+    if (file.state === 'discovered' && wanted) return { state: 'pending' };
+    if (file.state === 'pending' && !wanted) return { state: 'discovered' };
+    return null;
+  });
+  const counts = await store.attachmentCounts(job.id);
+  if (!counts.pending && !formats.length) throw new Error('Nothing to save: tick some files or choose an email format.');
+
+  if (counts.pending) {
+    const tab = await requireGmailTab();
+    pendingPassphrase = passphrase;
+    await store.patchJob(job.id, { pendingExport: { formats, encrypted } });
+    await command('START_DOWNLOADS', { jobId: job.id }, tab.id);
+    lastStage = 'Saving files…';
+    missedPings = 0;
+    currentJob = await store.getJob(job.id);
+    await tick();
+    return;
+  }
+  await runExports(job, formats, passphrase);
+  $('encryptionPassphrase').value = '';
+}
+
+async function retryFailed() {
+  notice('');
+  const job = currentJob;
+  const rows = [];
+  for await (const file of store.iterateAttachments(job.id)) if (['failed', 'interrupted'].includes(file.state)) rows.push(file);
+  let resumed = 0;
+  for (const file of rows) {
+    if (file.state === 'interrupted' && Number.isInteger(file.downloadId)) {
+      const [item] = await chrome.downloads.search({ id: file.downloadId });
+      if (item?.state === 'interrupted' && item.canResume) {
+        try {
+          await chrome.downloads.resume(file.downloadId);
+          await store.patchAttachment(file.id, { state: 'in_progress', error: null });
+          resumed++;
+          continue;
+        } catch {
+          // Fall through and download it again.
+        }
+      }
+    }
+    await store.patchAttachment(file.id, { state: 'pending', error: null, downloadId: null });
+  }
+  const counts = await store.attachmentCounts(job.id);
+  if (counts.pending) {
+    await command('START_DOWNLOADS', { jobId: job.id });
+    lastStage = 'Retrying files…';
+    missedPings = 0;
+  } else if (resumed) {
+    notice(`Resumed ${resumed} download(s).`, 'info');
+  }
+  currentJob = await store.getJob(job.id);
+  shownJobKey = '';
+  await tick();
+}
+
+async function setAllFiles(selected) {
+  await store.updateAttachments(currentJob.id, file => (['discovered', 'pending'].includes(file.state) ? { selected } : null));
+  shownJobKey = '';
+  await tick();
+}
+
+async function deselectDuplicates() {
+  const files = [];
+  for await (const file of store.iterateAttachments(currentJob.id)) if (file.selected && file.state === 'discovered') files.push({ id: file.id, fileName: file.fileName, sizeBytes: file.sizeBytes });
+  const ids = new Set(attachmentAnalysis.likelyDuplicateIds(files));
+  await store.updateAttachments(currentJob.id, file => (ids.has(file.id) ? { selected: false } : null));
+  notice(`Unticked ${ids.size} file(s) with the same name and size as another. Compared by name and size only, not by content.`, 'info');
+  shownJobKey = '';
+  await tick();
+}
+
+// ---- Batches, presets and tools ----
+
+async function loadBatches() {
+  const jobs = await store.listJobs();
+  jobs.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  const options = [new Option('Choose a batch…', '')];
+  for (const job of jobs) options.push(new Option(`${job.name} · ${job.counters.matched} matched · ${STATE_LABELS[job.status] || job.status}`, job.id));
+  $('jobs').replaceChildren(...options);
+  const estimate = await navigator.storage?.estimate?.();
+  $('storageUsage').textContent = estimate?.usage == null ? '' : `${(estimate.usage / 1048576).toFixed(1)} MB of captured mail is stored in this browser. Batches stay until you delete them.`;
+}
+
+async function deleteBatch() {
+  if (!confirm(`Delete ${currentJob.name} from this browser? Files already saved to disk stay.`)) return;
+  await store.deleteJob(currentJob.id);
+  await setCurrentJob(null);
+  await loadBatches();
+  notice('Batch deleted.', 'info');
+  await tick();
+}
+
+async function loadPresets() {
+  const presets = await store.listPresets();
+  const options = [new Option('Choose a saved search…', '')];
+  for (const preset of presets.sort((a, b) => a.name.localeCompare(b.name))) options.push(new Option(preset.name, preset.id));
+  $('presets').replaceChildren(...options);
+}
+
+async function savePreset() {
+  const name = $('presetName').value.trim();
+  if (!name) throw new Error('Type a name for this search first.');
+  const now = new Date().toISOString();
+  const existing = (await store.listPresets()).find(preset => preset.name === name);
+  await store.putPreset({ id: existing?.id || `preset-${crypto.randomUUID()}`, name, form: readForm(), updatedAt: now });
+  $('presetName').value = '';
+  await loadPresets();
+  notice(`Saved "${name}".`, 'info');
+}
+
+async function diagnosticsText() {
+  const job = currentJob;
+  const events = job ? await store.getEvents(job.id) : [];
+  const counts = job ? await store.attachmentCounts(job.id) : null;
+  const report = {
+    extensionVersion: chrome.runtime.getManifest().version,
+    browser: navigator.userAgent.replace(/\([^)]*\)/g, '(platform hidden)'),
+    job: job && {
+      status: job.status, phase: job.phase, counters: job.counters, partialReasons: job.partialReasons, stopReason: job.stopReason,
+      scope: job.config.source.mode, formats: job.config.output.formats, pacingMs: job.config.source.pacingMs
+    },
+    files: counts,
+    events: events.map(event => ({ at: event.createdAt, type: event.type, detail: event.detail }))
+  };
+  return JSON.stringify(report, null, 2);
+}
+
+async function checkCompatibility() {
+  const response = await command('CHECK_COMPAT');
+  $('compatReport').textContent = JSON.stringify(response.report, null, 2);
+  $('compatReport').hidden = false;
+}
+
+async function decrypt() {
+  const file = $('decryptFile').files?.[0];
+  if (!file) return;
+  try {
+    const result = await exportEngine.decryptBlob(file, $('decryptPassphrase').value);
+    const url = URL.createObjectURL(result.blob);
+    const name = pathSafety.sanitizeFileName(result.contentName, 'inboxfoundry-export.zip');
+    await new Promise((resolve, reject) => chrome.downloads.download({ url, filename: `InboxFoundry/decrypted/${name}`, conflictAction: 'uniquify', saveAs: false }, id => (id ? resolve() : reject(new Error(chrome.runtime.lastError?.message)))));
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    notice(`Decrypted to Downloads/InboxFoundry/decrypted/${name}.`, 'info');
+  } catch {
+    notice('Could not decrypt this file. Check the passphrase and that the file is complete.');
+  } finally {
+    $('decryptFile').value = '';
+    $('decryptPassphrase').value = '';
+  }
+}
+
+// ---- Wiring ----
+
+function wire() {
+  $('noticeClose').addEventListener('click', () => notice(''));
+  $('acknowledge').addEventListener('click', guarded(async () => {
+    consented = true;
+    await chrome.storage.local.set({ [CONSENT_KEY]: true });
+    $('consent').hidden = true;
+    await tick();
+  }));
+  $('start').addEventListener('click', guarded(startScan));
+  $('resume').addEventListener('click', guarded(resumeScan));
+  $('stop').addEventListener('click', guarded(stopJob));
+  $('preview').addEventListener('click', guarded(previewThread));
+  $('save').addEventListener('click', guarded(save));
+  $('retryFailed').addEventListener('click', guarded(retryFailed));
+  $('deleteBatch').addEventListener('click', guarded(deleteBatch));
+  $('threadsMore').addEventListener('click', guarded(appendThreads));
+  $('filesMore').addEventListener('click', guarded(appendFiles));
+  $('selectAllFiles').addEventListener('click', guarded(() => setAllFiles(true)));
+  $('selectNoFiles').addEventListener('click', guarded(() => setAllFiles(false)));
+  $('deselectDuplicates').addEventListener('click', guarded(deselectDuplicates));
+  $('encryptExport').addEventListener('change', () => { $('encryptFields').hidden = !$('encryptExport').checked; });
+  $('formats').addEventListener('change', () => { formatsTouched = true; });
+  $('searchSection').addEventListener('input', refreshFormHints);
+  $('searchSection').addEventListener('change', event => {
+    if (event.target.name === 'intent') applyIntentDefaults();
+    refreshFormHints();
+  });
+  $('savePreset').addEventListener('click', guarded(savePreset));
+  $('loadPreset').addEventListener('click', guarded(async () => {
+    const preset = (await store.listPresets()).find(item => item.id === $('presets').value);
+    if (!preset) throw new Error('Choose a saved search first.');
+    writeForm(preset.form);
+    applyIntentDefaults();
+    refreshFormHints();
+  }));
+  $('deletePreset').addEventListener('click', guarded(async () => {
+    if (!$('presets').value) throw new Error('Choose a saved search first.');
+    await store.deletePreset($('presets').value);
+    await loadPresets();
+  }));
+  $('openBatch').addEventListener('click', guarded(async () => {
+    if (!$('jobs').value) throw new Error('Choose a batch first.');
+    await setCurrentJob($('jobs').value);
+    await tick();
+  }));
+  $('clearJobs').addEventListener('click', guarded(async () => {
+    if (jobMachine.isActive(currentJob)) throw new Error('Stop the running job first.');
+    if (!confirm('Delete every batch from this browser? Files already saved to disk stay.')) return;
+    await store.clearJobs();
+    await setCurrentJob(null);
+    await loadBatches();
+    notice('All batches deleted.', 'info');
+    await tick();
+  }));
+  $('forgetHistory').addEventListener('click', guarded(async () => {
+    if (!confirm('Forget which mail was already saved? The next repeat export will include it again.')) return;
+    await store.clearLedger();
+    notice('Saved-mail history cleared.', 'info');
+  }));
+  $('checkCompat').addEventListener('click', guarded(checkCompatibility));
+  $('copyDiagnostics').addEventListener('click', guarded(async () => {
+    const text = await diagnosticsText();
+    $('compatReport').textContent = text;
+    $('compatReport').hidden = false;
+    await navigator.clipboard?.writeText(text).catch(() => {});
+    notice('Diagnostics are shown below and copied if the browser allowed it. They contain no mail content.', 'info');
+  }));
+  $('decryptFile').addEventListener('change', guarded(decrypt));
+}
+
+async function init() {
+  $('version').textContent = `v${chrome.runtime.getManifest().version}`;
+  wire();
+  const stored = await chrome.storage.local.get([CONSENT_KEY, CURRENT_JOB_KEY, FORM_KEY]);
+  consented = stored[CONSENT_KEY] === true;
+  $('consent').hidden = consented;
+  writeForm(stored[FORM_KEY]);
+  applyIntentDefaults();
+  refreshFormHints();
+  await Promise.all([loadPresets(), loadBatches()]);
+  if (stored[CURRENT_JOB_KEY]) await setCurrentJob(stored[CURRENT_JOB_KEY]);
+  await tick();
+  let busy = false;
+  setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      await tick();
+    } catch (error) {
+      console.error('[InboxFoundry]', error);
+    } finally {
+      busy = false;
+    }
+  }, 1200);
+}
+
+init().catch(error => notice(friendlyError(error)));

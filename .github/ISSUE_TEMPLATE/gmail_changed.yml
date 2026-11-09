@@ -1,0 +1,28 @@
+name: Gmail page changed
+description: Something stopped working on Gmail. Include only the compatibility check, never mail.
+title: "[Gmail]: "
+labels: [gmail-compatibility]
+body:
+  - type: markdown
+    attributes:
+      value: "Never paste real email, addresses, subjects, file names, Gmail URLs, or IDs. The compatibility check contains counts only."
+  - type: input
+    id: browser
+    attributes: { label: Browser and version }
+    validations: { required: true }
+  - type: input
+    id: language
+    attributes: { label: Gmail language }
+    validations: { required: true }
+  - type: textarea
+    id: list
+    attributes: { label: Compatibility check on a Gmail list, render: json }
+    validations: { required: true }
+  - type: textarea
+    id: conversation
+    attributes: { label: Compatibility check with a conversation open, render: json }
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes: { label: What went wrong? }
+    validations: { required: true }

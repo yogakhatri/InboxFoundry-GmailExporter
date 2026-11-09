@@ -2,155 +2,90 @@
 
 ![InboxFoundry icon](assets/icon128.png)
 
-InboxFoundry is a privacy-first Chrome extension for filtering, organizing, and exporting Gmail conversations and attachments. It works locally against the Gmail interface: there is no account service, analytics SDK, remote processing, or Gmail API setup.
+Find exactly the Gmail conversations and attachments you need and save them to your computer. No account, no server, no setup.
 
-> Independent open-source software; not affiliated with or endorsed by Google. Gmail is a trademark of Google LLC.
+> Independent open-source software, not affiliated with or endorsed by Google. Gmail is a trademark of Google LLC.
+>
+> **Status: 0.1.0 pre-release.** It's tested thoroughly against a Gmail-shaped test page, but not yet confirmed against live Gmail. Please run [the compatibility check](#check-gmail-compatibility) and report what you see.
 
-## Highlights
+## What it does
 
-- Scan the current Gmail inbox, label, category, or search across all result pages.
-- Build Gmail searches for sender, recipient, date, label, size, attachment, unread, starred, and `in:anywhere` scope.
-- Include or exclude keywords using ANY/ALL, contains, exact, starts/ends with, wildcard, whole-word, case-sensitive, or guarded regular-expression matching.
-- Match subject, body, sender, recipients, visible headers, or attachment names.
-- Filter sender, recipient, domain, subject, and date independently.
-- Export whole matching threads or matching messages only, with match evidence.
-- Independently ignore files, retain metadata, download every file, or download matching files only.
-- Filter friendly file groups, custom extensions, filenames, and known file sizes.
-- Safely stop after the current thread, export partial results, and resume durable checkpoints.
-- Retain three named batches and five custom presets, plus starter workflows.
-- Create incremental batches, safe folder templates, and split JSON archives.
-- Export JSON, NDJSON, CSV, text, Markdown, searchable HTML, merged basic PDF, indexed/checksummed individual-PDF and reconstructed-EML ZIPs, reconstructed MBOX, an attachment manifest, and a verifiable evidence ZIP.
-- Create and locally decrypt passphrase-protected AES-256-GCM JSON archives.
-- Record Chrome download completion/interruption state and SHA-256 integrity hashes.
-- Review discovered file decisions and durable download tasks, turn selected filenames into reusable include/exclude rules, and selectively resume interrupted files.
-- Group likely duplicate attachments by normalized filename and known size, and group common draft/final/version filename families with explicit metadata-only confidence labels.
-- Opt in to inspect explicitly selected local files: calculate real SHA-256 hashes, prove identical content, search supported documents, and run fully local English OCR on images or scanned PDFs without uploading or persisting their contents.
-- Review transparent local document classifications, suggested invoice/PO/contract fields, and likely email/phone/card/IBAN/US-SSN patterns; optionally create best-effort redacted text copies.
+1. **Search.** Choose attachments, emails, or both. Fill in sender, dates, words, or file type, and InboxFoundry runs that search in your open Gmail tab.
+2. **Review.** It opens each result and lists the conversations and files it found. Nothing downloads yet. Untick anything you don't want.
+3. **Save.** Attachments go into tidy folders, and emails into the formats you pick:
 
-Free safety limits are 250 matched threads and 500 attachment downloads per job. Rejected threads do not consume the match limit.
+```text
+Downloads/InboxFoundry/Batch 001 2026-08-29/
+├── archive.zip
+└── 00001 - Invoice for August/
+    └── Message-001/invoice.pdf
+```
+
+| Format | Good for |
+| --- | --- |
+| Complete archive ZIP | One file with JSON, a spreadsheet, a readable page, a file list, and checksums |
+| Readable page (HTML) | Reading and searching, or printing to save as PDF in any language |
+| Spreadsheet (CSV) | One row per message |
+| Data (JSON) | The most complete record, for scripts and analysis |
+| MBOX, or EML in a ZIP | Opening in a mail program. These are rebuilt from the page, so read [the limits](#known-limits) |
+| List of files (CSV) | What was found, what was saved, and what wasn't |
+
+Tick **Encrypt** to write a single passphrase-protected file instead, with no plain copy of the exports.
+
+**Is this the right tool?** InboxFoundry is for a *specific subset* of your mail. For a whole-mailbox backup, use [Google Takeout](https://takeout.google.com) or [Got Your Back](https://github.com/GAM-team/got-your-back).
 
 ## Install from source
 
-InboxFoundry requires Chrome 114 or newer.
+Requires Chrome, Edge, Brave, or another Chromium browser, version 116 or newer.
 
 1. Download or clone this repository.
-2. Open `chrome://extensions` and enable **Developer mode**.
-3. Choose **Load unpacked** and select the folder containing `manifest.json`.
-4. Reload Gmail once after installation or an extension update.
-5. Pin **InboxFoundry** for quick access.
+2. Open `chrome://extensions` and turn on **Developer mode**.
+3. Choose **Load unpacked** and select this folder.
+4. Open Gmail and click the InboxFoundry toolbar icon to open the side panel.
 
-## First export
+## Good to know
 
-1. Open Gmail in a list view, such as Inbox, All Mail, a label, or search results.
-2. Open InboxFoundry and select **Open filter workspace**.
-3. Read and acknowledge the local-data disclosure.
-4. Optionally build a Gmail query and open it in Gmail.
-5. Configure email rules, attachment rules, formats, and safety limits.
-6. Open a representative conversation and choose **Preview open thread**, or choose **Test current-list sample** for a first-N dry run. Neither preview creates a job, saves message content, or downloads attachments.
-7. Return to the Gmail list and choose **Start new export**. Keep that tab open and do not navigate it while the job runs.
-8. If Chrome asks, allow multiple downloads from Gmail.
+- **Opening a conversation marks it as read.** InboxFoundry reads mail by opening it in the page, so this can't be avoided. It tells you how many were unread, and marks them in the review list. Narrow your search to open fewer conversations.
+- **Keep the Gmail tab open.** It's safest to leave the tab visible. A background tab keeps working but may be slower.
+- **Stop is safe.** Stop finishes the current conversation. Everything captured is kept, can be saved, and can be resumed. Reloading Gmail, closing the tab, and restarting the browser don't lose completed work either.
+- **It never hides a gap.** If a conversation can't be read, a limit is reached, or the last page can't be confirmed, the batch is marked **partial** on screen and in every export, with the reason.
+- **Repeat exports.** Turn on "Skip mail already saved" to export only what's new from the same search. Conversations with new replies are picked up again.
+- **Your data.** Captured mail stays in this browser until you delete the batch. Nothing is deleted automatically. See [PRIVACY.md](PRIVACY.md).
 
-The popup also provides a quick unfiltered export. First-time users must acknowledge the disclosure in the workspace before any export starts.
+## Check Gmail compatibility
 
-## Stop, resume, and batches
+Gmail changes its page without notice, and this extension depends on it. Under **Batches, data and help**, press **Run check** once on a Gmail list and once with a conversation open. It's read-only and reports only counts, never mail content, so you can safely paste the result into an issue.
 
-**Stop safely** finishes and checkpoints the current thread, then stops before opening another. Enable automatic partial export or choose **Export saved results** afterward. Use **Resume saved job** from the same Gmail view to continue without repeating completed threads.
+## Known limits
 
-Each new export gets a separate batch and download folder. The three newest jobs can be reopened under **Recent batches**.
-
-Open **Attachment review** for a retained batch to inspect matched/excluded filenames, classifications, sizes, and download states. Select discovered names to add them to the next batch's include or exclude rules. Interrupted Chrome downloads can be selected and resumed individually when Chrome reports that they are resumable.
-
-Open **Local file inspector** to choose downloaded files manually. InboxFoundry incrementally hashes files up to 2 GB with progress and cancellation, temporarily extracts up to 2 MB from ordinary text files, and safely parses selected text PDFs, DOCX, XLSX, and PPTX within separate stream/package and total-text limits. PDF support includes common embedded `ToUnicode` font maps, inherited/indirect font resources, ASCIIHex, ASCII85, RunLength, Flate, and bounded filter chains. Search results identify the matching XLSX sheet, PPTX slide, DOCX part, or PDF content stream.
-
-English OCR is a separate opt-in. It uses bundled Tesseract.js and PDF.js assets entirely inside the extension, processes selected files sequentially, and is used for supported images or PDFs that have no searchable text. The default limits are 20 selected images/PDF pages for the session, 10 pages per PDF, 20 MB per image, 50 MB per PDF, 16 megapixels per render, and 2 million recognized characters. Cancellation terminates the OCR worker. The first OCR run can take longer while the bundled model initializes; scanned-PDF OCR requires Chrome 118 or newer, while the rest of InboxFoundry remains supported from Chrome 114.
-
-The inspector can prove content-identical files even when names differ, suggest business-document types and fields, and flag likely sensitive patterns. Extracted and OCR text and snippets stay out of reports; structured suggestions enter a report only after checking the approval control. Optional redacted copies never alter originals, include original/redacted hashes, per-pattern counts, a manifest and checksums, and must still be reviewed because automated detection can miss content. Clearing the inspector, cancelling analysis, or closing the side panel releases its in-memory content.
-
-```text
-Downloads/
-└── InboxFoundry/
-    └── Batch 001 · 8-29-2026/
-        └── 00001 - Example subject/
-            ├── Message-001/invoice.pdf
-            └── Message-002/rates.xlsx
-```
-
-Chrome uniquifies conflicts; InboxFoundry never overwrites an existing download.
-
-## Rule behavior
-
-Email inclusion and file downloading are separate. A matching email can be exported while its files are ignored or metadata-only. **Require an attachment matching file rules** explicitly makes a matching file necessary for email inclusion.
-
-Exclusions override inclusions. Whole-thread mode includes the complete loaded conversation when a message matches; matching-message mode keeps only matched messages and records original indexes. Gmail search defines candidates, but InboxFoundry re-checks local rules inside each thread.
-
-Regular expressions are length- and complexity-guarded. File-size rules apply when Gmail exposes a recognizable size; unknown size behavior is recorded in the configuration.
-
-## Output
-
-JSON format version 2 contains the immutable configuration, source URL, lifecycle and partial flag, counters, records, match evidence, attachment results, Chrome download states, and SHA-256 integrity manifest. CSV formulas are neutralized. Printable HTML uses escaped text and does not execute captured email HTML.
-
-**Evidence ZIP** packages canonical JSON, NDJSON, CSV, searchable HTML, an attachment manifest, metadata duplicate/version analysis, a plain-language README, and `CHECKSUMS.sha256`. Attachment binaries stay in their recorded Downloads folders: InboxFoundry deliberately does not request broad filesystem-read access merely to copy them back into the ZIP.
-
-See [the export specification](docs/EXPORT_FORMAT.md), [audited implementation status](docs/IMPLEMENTATION_STATUS.md), [release test matrix](docs/TESTING.md), and [feature roadmap](docs/FEATURE_ROADMAP.md).
-
-## Privacy and permissions
-
-Email records and job state are stored in extension-owned IndexedDB. Small settings use `chrome.storage.local`. Requested exports and attachments go to Downloads. Deleting a job does not remove already downloaded files.
-
-| Permission | Purpose |
-| --- | --- |
-| `https://mail.google.com/*` | Read the visible Gmail interface and use conversation/attachment controls. |
-| `storage` | Store preferences and active-job metadata locally. |
-| `unlimitedStorage` | Support larger local jobs, subject to available disk space. |
-| `downloads` | Route and track requested attachment downloads. |
-| `sidePanel` | Provide the persistent filtering and job workspace. |
-
-No permission grants access to non-Gmail websites. See [PRIVACY.md](PRIVACY.md) and [SECURITY.md](SECURITY.md).
-
-## Known limitations
-
-- DOM mode depends on Gmail's interface and may need selector maintenance after Gmail changes.
-- Gmail language can affect pagination/control detection; English has the best current coverage.
-- The Gmail tab must stay open. Completed checkpoints remain resumable after interruption.
-- Gmail may not expose size, MIME type, or a usable control for every attachment, Drive link, or signature asset.
-- PDF extraction supports ordinary unencrypted text PDFs with common embedded Unicode maps and bounded plain, Flate, ASCIIHex, ASCII85, and RunLength streams. Opt-in OCR supports English text in PNG, JPEG, WebP, BMP, GIF, and scanned PDFs, but it is best-effort: handwriting, low-resolution pages, complex layouts, and languages other than English may be inaccurate. Searchable PDFs bypass OCR. Encrypted PDFs and SVG are not OCRed. Object streams, LZW, unusual CMaps, predictors, uncommon filters, or missing Unicode maps may yield incomplete direct extraction. Legacy Office, audio, video, and other binary formats are hash-only. Incremental hashing is skipped above the 2 GB per-file safety limit.
-- Basic PDF is text-oriented. DOM-mode EML/MBOX files are clearly marked reconstructions and omit unavailable transport headers, original MIME structure, and attachment binaries; exact source messages require a future, separately consented Gmail API engine.
-- Normal exports and separately downloaded attachments are not encrypted. The optional `.ifenc` JSON archive is passphrase encrypted, but its separately downloaded attachments are not packaged inside it.
+- Reads the Gmail web page. A Gmail redesign can break it until the selectors in [`lib/gmail-adapter.js`](lib/gmail-adapter.js) are updated.
+- EML and MBOX files are rebuilt from the page, not Google's original messages. They have no original transport headers, To and Cc are merged, and attachments stay in their folders rather than inside each message.
+- Checksums detect accidental corruption. They aren't proof of authenticity, and these exports aren't forensic evidence.
+- Google Drive links and files Gmail offers no download for are listed but not downloaded. Images embedded inside a message body aren't saved as files.
+- Encryption covers the export files only. Downloaded attachments aren't encrypted, and captured mail stays readable in the browser until you delete the batch.
+- The interface is in English. It's built to work with Gmail in other languages, but hasn't yet been confirmed on live Gmail in any language.
 
 ## Troubleshooting
 
-- **Cannot connect:** reload Gmail once after installing/updating.
-- **No rows found:** return to a Gmail list/search, not an open conversation.
-- **Resume refused:** return to the original Gmail list/search for that batch.
-- **Files blocked:** allow multiple downloads for `mail.google.com` and inspect `chrome://downloads`.
-- **Selector failure:** report Chrome/Gmail language and sanitized diagnostics; never post mailbox content.
+- **"Open Gmail in this window":** make the Gmail tab active in the same window as the panel.
+- **Files fail with a click-related message:** allow multiple downloads for `mail.google.com`, or check `chrome://downloads`.
+- **"Ask where to save each file" is on in Chrome:** a few files may show a save dialog. Turning that setting off avoids it.
+- **Something looks wrong:** run the compatibility check, press **Copy diagnostics**, and open an issue. Neither contains mail content. Never post real email.
 
 ## Development
 
 ```bash
+npm install
 npm test
-```
-
-This runs syntax, filter/export unit tests, and manifest/resource validation. Follow [CONTRIBUTING.md](CONTRIBUTING.md) for manual Gmail regression testing. Report vulnerabilities via [SECURITY.md](SECURITY.md).
-
-Run the account-free browser lifecycle gate (requires OpenSSL and a compatible Chromium/Brave executable):
-
-```bash
-npm run test:browser
-```
-
-It uses a fresh temporary browser profile and a loopback-only synthetic Gmail fixture to verify filtering, safe Stop, partial-export availability, resume, IndexedDB durability, workspace loading, service-worker restart, reload recovery, and the actual bundled OCR stack against synthetic image and scanned-PDF fixtures. `npm run test:release` runs both automated gates. See [release testing](docs/TESTING.md) for requirements and the remaining real-Gmail synthetic matrix.
-
-To build an allowlisted Chrome release archive after the full automated gate passes:
-
-```bash
+npm run lint
+npm run test:e2e
 npm run package
 ```
 
-The command creates `dist/inboxfoundry-vVERSION.zip` and a matching SHA-256 checksum. It deliberately excludes source-control metadata, tests, issue templates, and local files.
+There's no build step. `npm run test:e2e` needs Chromium and OpenSSL, because branded Chrome 137+ can't load unpacked extensions from the command line. See [docs/TESTING.md](docs/TESTING.md), [docs/EXPORT_FORMAT.md](docs/EXPORT_FORMAT.md), [ROADMAP.md](ROADMAP.md), and [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Community expectations and help boundaries are documented in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) and [SUPPORT.md](SUPPORT.md).
+Much of this code was written with AI assistance and is checked by the automated tests described above. Independent human review is welcome, especially of anything that handles mail.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Report vulnerabilities through [SECURITY.md](SECURITY.md).

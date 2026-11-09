@@ -3,126 +3,100 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const downloadPolicy = require('../lib/download-policy.js');
+const pathSafety = require('../lib/path-safety.js');
+const gmailAdapter = require('../lib/gmail-adapter.js');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'background.js'), 'utf8');
+const hook = store => ({ addListener(fn) { store.push(fn); }, removeListener(fn) { store.splice(store.indexOf(fn), 1); }, hasListener(fn) { return store.includes(fn); } });
 
 function harness(overrides = {}) {
-  const listeners = { messages:[], created:[], changed:[], erased:[], determining:[], removed:[] };
-  const resumed = [];
-  const saved = [];
-  const rows = overrides.rows || [];
+  const listeners = { message: [], created: [], filename: [], changed: [], erased: [] };
+  const attachments = new Map(Object.entries(overrides.attachments || {}));
   const jobStore = {
-    listJobs: async () => [], patchJob: async () => {},
-    getDownloads: async () => rows,
-    putDownload: async value => { saved.push(value); return value; },
-    getDownloadByChromeId: async id => rows.find(row => row.downloadId === id) || null,
-    patchDownloadByChromeId: async () => null,
+    listJobs: async () => overrides.jobs || [],
+    patchJob: async (id, patch) => { (overrides.patched ||= []).push({ id, patch }); },
+    getAttachment: async id => attachments.get(id),
+    patchAttachment: async (id, patch) => attachments.set(id, { ...attachments.get(id), ...patch }),
+    patchByChromeId: async () => null,
     ...overrides.jobStore
   };
+  const calls = [];
   const chrome = {
-    runtime: {
-      lastError:null,
-      onInstalled:{ addListener() {} },
-      onMessage:{ addListener(fn) { listeners.messages.push(fn); } }
-    },
-    sidePanel:{ setPanelBehavior:async () => {}, open:async () => {} },
-    tabs:{ onRemoved:{ addListener(fn) { listeners.removed.push(fn); } } },
-    storage:{ local:{ remove:async () => {}, get:async () => ({}) } },
-    downloads:{
-      search: async ({ id }) => overrides.downloadItems?.filter(item => item.id === id) || [],
-      resume: async id => { resumed.push(id); },
-      download: overrides.download || ((_options, callback) => callback(99)),
-      onCreated:{ addListener(fn) { listeners.created.push(fn); } },
-      onChanged:{ addListener(fn) { listeners.changed.push(fn); } },
-      onErased:{ addListener(fn) { listeners.erased.push(fn); } },
-      onDeterminingFilename:{ addListener(fn) { listeners.determining.push(fn); } }
+    runtime: { id: 'ext', lastError: null, onInstalled: hook([]), onStartup: hook([]), onMessage: hook(listeners.message) },
+    sidePanel: { setPanelBehavior: async () => {} },
+    tabs: { onRemoved: hook(overrides.removed || []) },
+    downloads: {
+      download(options, callback) {
+        calls.push(options);
+        const failure = overrides.failDownload?.(options, calls.length);
+        chrome.runtime.lastError = failure ? { message: failure } : null;
+        callback(failure ? undefined : 99);
+        chrome.runtime.lastError = null;
+      },
+      onCreated: hook(listeners.created), onChanged: hook(listeners.changed), onErased: hook(listeners.erased), onDeterminingFilename: hook(listeners.filename)
     }
   };
   const context = vm.createContext({
-    chrome, console:{ ...console, error:() => {} }, URL, Map, Date, Math,
-    setInterval:() => 1,
-    importScripts:() => {},
-    InboxFoundry:{
-      jobStore,
-      pathSafety:{ sanitizePart:value => String(value || 'fallback'), sanitizeFolderPath:value => String(value || 'fallback') },
-      downloadPolicy
-    }
+    chrome, console: { ...console, error() {} }, URL, Date, Math, Map, Number, String, Promise, crypto: globalThis.crypto, setTimeout,
+    importScripts() {}, InboxFoundry: { jobStore, pathSafety, gmailAdapter }
   });
-  vm.runInContext(source, context, { filename:'background.js' });
-
-  async function message(msg) {
-    return new Promise((resolve, reject) => {
-      let handled = false;
-      for (const listener of listeners.messages) {
-        const result = listener(msg, { tab:{ id:7, windowId:1 } }, resolve);
-        if (result === true) handled = true;
-      }
-      if (!handled) reject(new Error(`No handler for ${msg.type}`));
-      setTimeout(() => reject(new Error(`Timed out handling ${msg.type}`)), 1000).unref?.();
-    });
-  }
-
-  return { listeners, message, resumed, saved };
+  vm.runInContext(source, context);
+  const message = (msg, sender = { id: 'ext', tab: { id: 7 } }) => new Promise(resolve => {
+    const handled = listeners.message[0](msg, sender, resolve);
+    if (!handled) resolve('not-handled');
+  });
+  return { listeners, message, calls, attachments };
 }
+const file = { id: 'a', url: 'https://mail.google.com/mail/u/0?view=att', rootFolder: 'InboxFoundry', folder: 'Batch/00001 - x/Message-001', fileName: 'report.pdf', messageIndex: 1, ordinal: 1 };
 
-test('selective retry resumes only chosen interrupted Chrome tasks', async () => {
-  const rows = [
-    { id:'a', state:'interrupted', downloadId:11 },
-    { id:'b', state:'interrupted', downloadId:12 },
-    { id:'c', state:'complete', downloadId:13 }
-  ];
-  const h = harness({ rows, downloadItems:[
-    { id:11, state:'interrupted', canResume:true, exists:true },
-    { id:12, state:'interrupted', canResume:true, exists:true }
-  ] });
-  const result = await h.message({ type:'RETRY_INTERRUPTED_DOWNLOADS', jobId:'job', taskIds:['b','c'] });
+test('refuses unknown messages and other senders', async () => {
+  const h = harness();
+  assert.equal(await h.message({ type: 'DB_CLEAR_JOBS' }), 'not-handled');
+  assert.equal(await h.message({ type: 'GET_CONTEXT' }, { id: 'someone-else' }), 'not-handled');
+  assert.equal((await h.message({ type: 'GET_CONTEXT' })).result.tabId, 7);
+});
+
+test('direct download routes into the batch folder', async () => {
+  const h = harness({ attachments: { a: file } });
+  const { result } = await h.message({ type: 'START_DIRECT_DOWNLOAD', attachmentId: 'a' });
   assert.equal(result.ok, true);
-  assert.equal(result.requested, 1);
-  assert.equal(result.resumed, 1);
-  assert.deepEqual(h.resumed, [12]);
-  assert.equal(h.saved.at(-1).state, 'in_progress');
+  assert.equal(h.calls[0].filename, 'InboxFoundry/Batch/00001 - x/Message-001/report.pdf');
+  assert.equal(h.calls[0].conflictAction, 'uniquify');
+  assert.equal(h.attachments.get('a').state, 'in_progress');
 });
 
-test('direct downloads report a started-but-uncheckpointed failure', async () => {
-  const h = harness({ jobStore:{
-    listJobs:async () => [], getDownloads:async () => [],
-    putDownload:async () => { throw new Error('quota'); },
-    getDownloadByChromeId:async () => null, patchDownloadByChromeId:async () => null
-  } });
-  const result = await h.message({ type:'DIRECT_DOWNLOAD', url:'https://mail.google.com/file', jobId:'job', taskId:'opaque', fileName:'file.pdf', folder:'Batch' });
-  assert.equal(result.ok, false);
-  assert.equal(result.downloadStarted, true);
-  assert.equal(result.downloadId, 99);
+test('a name Chrome refuses is saved under a plain name, not lost', async () => {
+  const h = harness({ attachments: { a: file }, failDownload: (_options, call) => (call === 1 ? 'Invalid filename' : null) });
+  const { result } = await h.message({ type: 'START_DIRECT_DOWNLOAD', attachmentId: 'a' });
+  assert.equal(result.ok, true);
+  assert.equal(h.calls[1].filename, 'InboxFoundry/Batch/attachment-1-1.pdf');
 });
 
-test('click downloads become visible only after their durable checkpoint succeeds', async () => {
-  let release;
-  const checkpoint = new Promise(resolve => { release = resolve; });
-  const h = harness({ jobStore:{
-    listJobs:async () => [], getDownloads:async () => [],
-    putDownload:async value => { await checkpoint; h.saved.push(value); return value; },
-    getDownloadByChromeId:async () => null, patchDownloadByChromeId:async () => null
-  } });
-  const prepared = await h.message({ type:'PREPARE_CLICK_DOWNLOAD', jobId:'job', taskId:'opaque', fileName:'file.pdf', folder:'Batch' });
-  h.listeners.created[0]({ id:55, url:'https://mail.google.com/file', filename:'file.pdf', exists:true });
-  const before = await h.message({ type:'CHECK_CLICK_DOWNLOAD', token:prepared.token });
-  assert.equal(before.created, false);
-  release();
-  await checkpoint;
+test('other download errors are reported, and non-Gmail URLs are never fetched', async () => {
+  const h = harness({ attachments: { a: file, b: { ...file, url: 'https://evil.test/x' } }, failDownload: () => 'Network down' });
+  assert.equal(JSON.stringify((await h.message({ type: 'START_DIRECT_DOWNLOAD', attachmentId: 'a' })).result), JSON.stringify({ ok: false, error: 'Network down' }));
+  assert.equal(JSON.stringify((await h.message({ type: 'START_DIRECT_DOWNLOAD', attachmentId: 'b' })).result), JSON.stringify({ ok: false, needsClick: true }));
+  assert.equal(h.calls.length, 1);
+});
+
+test('the filename listener exists only while a click route is open', async () => {
+  const h = harness({ attachments: { a: file } });
+  assert.equal(h.listeners.filename.length, 0);
+  const { result } = await h.message({ type: 'PREPARE_CLICK_DOWNLOAD', attachmentId: 'a', ttlMs: 9000 });
+  assert.equal(h.listeners.filename.length, 1);
+  assert.equal(h.listeners.created.length, 1);
+
+  // Another extension's download, and an unrelated site's, don't consume the route.
+  h.listeners.created[0]({ id: 1, url: 'https://mail.google.com/x', byExtensionId: 'other' });
+  h.listeners.created[0]({ id: 2, url: 'https://example.test/x', referrer: 'https://example.test' });
+  assert.equal((await h.message({ type: 'CHECK_CLICK_DOWNLOAD', token: result.token })).result.created, false);
+
+  h.listeners.created[0]({ id: 55, url: 'https://mail.google.com/mail/u/0?view=att', filename: '' });
   await new Promise(resolve => setImmediate(resolve));
-  const after = await h.message({ type:'CHECK_CLICK_DOWNLOAD', token:prepared.token });
-  assert.equal(after.created, true);
-  assert.equal(after.persisted, true);
-  assert.equal(after.downloadId, 55);
-});
-
-test('filename routing recovers from IndexedDB after a service-worker restart', async () => {
-  const h = harness({ rows:[{ id:'task', downloadId:77, rootFolder:'InboxFoundry', folder:'Batch/Message-001', fileName:'saved.pdf' }] });
-  const suggestion = await new Promise(resolve => {
-    const keepAlive = h.listeners.determining[0]({ id:77, filename:'actual.pdf' }, resolve);
-    assert.equal(keepAlive, true);
-  });
-  assert.equal(suggestion.filename, 'InboxFoundry/Batch/Message-001/actual.pdf');
-  assert.equal(suggestion.conflictAction, 'uniquify');
+  assert.equal(h.attachments.get('a').downloadId, 55);
+  const suggestion = await new Promise(resolve => h.listeners.filename[0]({ id: 55, filename: 'actual.pdf' }, resolve));
+  assert.equal(suggestion.filename, 'InboxFoundry/Batch/00001 - x/Message-001/actual.pdf');
+  const other = await new Promise(resolve => h.listeners.filename[0]({ id: 2, filename: 'mine.pdf' }, value => resolve(value ?? 'default')));
+  assert.equal(other, 'default');
+  assert.equal((await h.message({ type: 'CHECK_CLICK_DOWNLOAD', token: result.token })).result.created, true);
 });
